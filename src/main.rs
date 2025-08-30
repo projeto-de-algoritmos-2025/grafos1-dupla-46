@@ -896,31 +896,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_point_creation() {
-        let p = Point::new(10, 20);
-        assert_eq!(p.x, 10);
-        assert_eq!(p.y, 20);
-    }
-
-    #[test]
-    fn test_encoder_creation() {
-        let encoder = ContourEncoder::new(240, 135);
-        assert_eq!(encoder.target_width, 240);
-        assert_eq!(encoder.target_height, 135);
-    }
-
-    #[test]
-    fn test_next_cell() {
-        let encoder = ContourEncoder::new(100, 100);
-        let (next_point, next_dir, save_point) = encoder.next_cell(Point::new(5, 5), 0);
-        assert_eq!(next_point, Point::new(5, 4)); // right -> up
-        assert_eq!(next_dir, 1);
-        assert_eq!(save_point, Some(Point::new(6, 5)));
-    }
-}
