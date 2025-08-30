@@ -1,18 +1,22 @@
 use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+const EPSILON: f64 = 3.0;
+
+const EPSILON_SQUARED: f64 = EPSILON * EPSILON;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
     x: i32,
     y: i32,
 }
 
 impl Point {
-    fn new(x: i32, y: i32) -> Self {
-        Point { x, y }
+    const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
     }
 
-    fn to_f64(&self) -> Point2D {
+    const fn to_f64(&self) -> Point2D {
         Point2D {
             x: self.x as f64,
             y: self.y as f64,
@@ -28,8 +32,8 @@ pub struct Point2D {
 
 impl Point2D {
     #[allow(dead_code)]
-    fn new(x: f64, y: f64) -> Self {
-        Point2D { x, y }
+    const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
     }
 
     fn to_i32(&self) -> Point {
@@ -45,19 +49,19 @@ pub struct Vector2D {
 
 impl Vector2D {
     fn new(p1: Point2D, p2: Point2D) -> Self {
-        Vector2D {
+        Self {
             x: p2.x - p1.x,
             y: p2.y - p1.y,
         }
     }
 
     fn abs2(&self) -> f64 {
-        self.x * self.x + self.y * self.y
+        self.x.mul_add(self.x, self.y * self.y)
     }
 
     #[allow(dead_code)]
-    fn dot(&self, other: &Vector2D) -> f64 {
-        self.x * other.x + self.y * other.y
+    fn dot(&self, other: &Self) -> f64 {
+        self.x.mul_add(other.x, self.y * other.y)
     }
 }
 
@@ -81,7 +85,8 @@ pub struct ContourEncoder {
 }
 
 impl ContourEncoder {
-    pub fn new(target_width: u32, target_height: u32) -> Self {
+    #[must_use]
+    pub const fn new(target_width: u32, target_height: u32) -> Self {
         Self {
             width: 0,
             height: 0,
@@ -107,7 +112,10 @@ impl ContourEncoder {
         }
 
         // Using the 2D optimized formula from the C++ implementation
-        let dist = line_vec.x * (line_start.y - point.y) - line_vec.y * (line_start.x - point.x);
+        let dist = line_vec.x.mul_add(
+            line_start.y - point.y,
+            -(line_vec.y * (line_start.x - point.x)),
+        );
         let dist_squared = dist * dist;
 
         // Normalize by line length squared for proper distance
@@ -194,14 +202,14 @@ impl ContourEncoder {
         }
     }
 
-    fn simplify_contour(&self, points: &[Point], epsilon: f64) -> Vec<Point> {
+    fn simplify_contour(&self, points: &[Point]) -> Vec<Point> {
         if points.len() <= 2 {
             return points.to_vec();
         }
 
         // Convert to f64 points for processing
-        let f64_points: Vec<Point2D> = points.iter().map(|p| p.to_f64()).collect();
-        let epsilon_squared = epsilon * epsilon;
+        let f64_points: Vec<Point2D> = points.iter().map(Point::to_f64).collect();
+        let epsilon_squared = EPSILON_SQUARED;
 
         let mut indices_to_keep = vec![0]; // Always keep the first point
 
@@ -234,10 +242,8 @@ impl ContourEncoder {
             .collect();
 
         // For closed contours, ensure the last point equals the first
-        if is_closed && !simplified.is_empty() {
-            if simplified.first() != simplified.last() {
-                simplified.push(simplified[0]);
-            }
+        if is_closed && !simplified.is_empty() && simplified.first() != simplified.last() {
+            simplified.push(simplified[0]);
         }
 
         simplified
@@ -266,7 +272,7 @@ impl ContourEncoder {
         let is_inverted = self.detect_inversion(&resized);
 
         println!("Image dimensions: {}x{}", self.width, self.height);
-        println!("Image is inverted: {}", is_inverted);
+        println!("Image is inverted: {is_inverted}");
 
         // Convert to binary and invert if necessary
         let binary_img = self.to_binary(&resized, is_inverted);
@@ -320,7 +326,7 @@ impl ContourEncoder {
         }
     }
 
-    fn is_valid_coord(&self, x: i32, y: i32) -> bool {
+    const fn is_valid_coord(&self, x: i32, y: i32) -> bool {
         x >= 0 && x < self.width as i32 && y >= 0 && y < self.height as i32
     }
 
@@ -408,44 +414,41 @@ impl ContourEncoder {
         let start_next = curr;
 
         loop {
-            if !(curr.x == start_next.x
+            if curr.x == start_next.x
                 && curr.y == start_next.y
                 && prev.x == start.x
                 && prev.y == start.y
-                && flag)
+                && flag
             {
-                flag = true;
+                break;
+            }
+
+            flag = true;
+            let (new_exam, new_dir, save_pixel) = self.next_cell(curr, direction);
+            exam = new_exam;
+            direction = new_dir;
+            if save_pixel.is_some() {
+                save = save_pixel;
+            }
+            while self.get_pixel_value(img, exam.x, exam.y) == 0 {
                 let (new_exam, new_dir, save_pixel) = self.next_cell(curr, direction);
                 exam = new_exam;
                 direction = new_dir;
                 if save_pixel.is_some() {
                     save = save_pixel;
                 }
-
-                while self.get_pixel_value(img, exam.x, exam.y) == 0 {
-                    let (new_exam, new_dir, save_pixel) = self.next_cell(curr, direction);
-                    exam = new_exam;
-                    direction = new_dir;
-                    if save_pixel.is_some() {
-                        save = save_pixel;
-                    }
-                }
-
-                // Update pixel values
-                self.update_pixel_value(img, curr, nbd, save);
-                save = None;
-
-                prev = curr;
-                curr = exam;
-                contour.push(curr);
-                direction = if direction >= 2 {
-                    direction - 2
-                } else {
-                    direction + 2
-                };
-            } else {
-                break;
             }
+            // Update pixel values
+            self.update_pixel_value(img, curr, nbd, save);
+            save = None;
+            prev = curr;
+            curr = exam;
+            contour.push(curr);
+            direction = if direction >= 2 {
+                direction - 2
+            } else {
+                direction + 2
+            };
         }
 
         contour
@@ -459,7 +462,7 @@ impl ContourEncoder {
         let mut img = vec![vec![0i32; cols]; rows];
         for y in 0..rows {
             for x in 0..cols {
-                img[y][x] = binary_img.get_pixel(x as u32, y as u32)[0] as i32;
+                img[y][x] = i32::from(binary_img.get_pixel(x as u32, y as u32)[0]);
             }
         }
 
@@ -495,10 +498,9 @@ impl ContourEncoder {
                         let parent_id =
                             self.find_parent_contour_id(nbd, &parents, &border_to_contour);
                         let contour = self.create_contour_from_points_with_parent(
-                            contour_points,
+                            &contour_points,
                             true,
                             parent_id,
-                            3.0,
                         );
                         let contour_idx = contours.len();
                         contours.push(contour);
@@ -544,10 +546,9 @@ impl ContourEncoder {
                         let parent_id =
                             self.find_parent_contour_id(nbd, &parents, &border_to_contour);
                         let contour = self.create_contour_from_points_with_parent(
-                            contour_points,
+                            &contour_points,
                             false,
                             parent_id,
-                            1.0,
                         );
                         let contour_idx = contours.len();
                         contours.push(contour);
@@ -608,23 +609,22 @@ impl ContourEncoder {
 
     fn create_contour_from_points_with_parent(
         &self,
-        points: Vec<Point>,
+        points: &[Point],
         is_outer: bool,
         parent_id: Option<usize>,
-        epsilon: f64,
     ) -> Contour {
-        let simplified_points = self.simplify_contour(&points, epsilon);
-        let chain_code = self.points_to_chain_code(&points);
+        let simplified_points = self.simplify_contour(points);
+        let chain_code = self.points_to_chain_code(points);
 
-        let simplification_ratio = if !simplified_points.is_empty() {
-            points.len() as f64 / simplified_points.len() as f64
-        } else {
+        let simplification_ratio = if simplified_points.is_empty() {
             1.0
+        } else {
+            points.len() as f64 / simplified_points.len() as f64
         };
 
         Contour {
             start_point: points[0],
-            points: points.clone(),
+            points: points.to_owned(),
             simplified_points,
             chain_code,
             is_outer,
@@ -643,10 +643,7 @@ impl ContourEncoder {
         i: usize,
         j: usize,
     ) {
-        if !border_types
-            .get(nbd as usize - 2)
-            .map_or(false, |&bt| bt == 1)
-        {
+        if border_types.get(nbd as usize - 2).is_none_or(|&bt| bt != 1) {
             let curr_pixel_val = img[i][j];
             if curr_pixel_val != 1 {
                 *lnbd = curr_pixel_val.abs();
@@ -664,10 +661,7 @@ impl ContourEncoder {
         i: usize,
         j: usize,
     ) {
-        if !border_types
-            .get(nbd as usize - 2)
-            .map_or(false, |&bt| bt == 0)
-        {
+        if border_types.get(nbd as usize - 2).is_none_or(|&bt| bt != 0) {
             let curr_pixel_val = img[i][j];
             if curr_pixel_val != 1 {
                 *lnbd = curr_pixel_val.abs();
@@ -768,11 +762,11 @@ impl ContourEncoder {
         for (i, contour) in contours.iter().enumerate() {
             let boundary_type = if contour.is_outer { "Outer" } else { "Hole" };
             let parent_info = match contour.parent_id {
-                Some(pid) => format!("Parent: {}", pid),
+                Some(pid) => format!("Parent: {pid}"),
                 None => "Root".to_string(),
             };
 
-            println!("Contour {}: {} boundary, {}", i, boundary_type, parent_info);
+            println!("Contour {i}: {boundary_type} boundary, {parent_info}");
             println!(
                 "  Start Point: ({}, {})",
                 contour.start_point.x, contour.start_point.y
@@ -810,13 +804,9 @@ impl ContourEncoder {
 
             println!("  Compression Analysis:");
             println!(
-                "    Coordinates: {} -> {} bits (ratio: {:.2}x)",
-                original_coordinate_bits, simplified_coordinate_bits, coordinate_compression_ratio
+                "    Coordinates: {original_coordinate_bits} -> {simplified_coordinate_bits} bits (ratio: {coordinate_compression_ratio:.2}x)"
             );
-            println!(
-                "    Chain codes: {} bits (no simplification)",
-                original_chain_bits
-            );
+            println!("    Chain codes: {original_chain_bits} bits (no simplification)");
 
             let best_original = original_coordinate_bits.min(original_chain_bits);
             let best_simplified = simplified_coordinate_bits;
@@ -827,8 +817,7 @@ impl ContourEncoder {
             };
 
             println!(
-                "    Best encoding: {} -> {} bits (ratio: {:.2}x)",
-                best_original, best_simplified, best_compression_ratio
+                "    Best encoding: {best_original} -> {best_simplified} bits (ratio: {best_compression_ratio:.2}x)"
             );
             println!("  ---");
         }
@@ -846,8 +835,7 @@ impl ContourEncoder {
         println!("=== Overall Statistics ===");
         println!("Total contours: {}", contours.len());
         println!(
-            "Total points: {} -> {} (reduction: {:.2}x)",
-            total_original_points, total_simplified_points, overall_simplification_ratio
+            "Total points: {total_original_points} -> {total_simplified_points} (reduction: {overall_simplification_ratio:.2}x)"
         );
 
         let total_memory_original = total_original_points * 16; // bits
@@ -870,21 +858,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let image_path = &args[1];
-    let mut encoder = ContourEncoder::new(240, 135);
+    let mut encoder = ContourEncoder::new(180, 135);
 
     match encoder.encode_image(image_path) {
         Ok((overlay_img, contour_only_img)) => {
             // Save output images
             let base_name = Path::new(image_path).file_stem().unwrap().to_str().unwrap();
 
-            let overlay_path = format!("{}_overlay.png", base_name);
-            let contour_path = format!("{}_contour.png", base_name);
+            let overlay_path = format!("{base_name}_overlay.png");
+            let contour_path = format!("{base_name}_contour.png");
 
             overlay_img.save(&overlay_path)?;
             contour_only_img.save(&contour_path)?;
 
-            println!("Saved overlay image to: {}", overlay_path);
-            println!("Saved contour image to: {}", contour_path);
+            println!("Saved overlay image to: {overlay_path}");
+            println!("Saved contour image to: {contour_path}");
 
             // For demonstration, let's find contours again to print chain codes
             let gray_img = image::open(image_path)?.to_luma8();
@@ -901,7 +889,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             encoder.print_chain_codes(&contours);
         }
         Err(e) => {
-            eprintln!("Error processing image: {}", e);
+            eprintln!("Error processing image: {e}");
             std::process::exit(1);
         }
     }
