@@ -1,10 +1,6 @@
 use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 use std::path::Path;
 
-const EPSILON: f64 = 3.0;
-
-const EPSILON_SQUARED: f64 = EPSILON * EPSILON;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
     x: i32,
@@ -15,65 +11,41 @@ impl Point {
     const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
-
-    const fn to_f64(&self) -> Point2D {
-        Point2D {
-            x: self.x as f64,
-            y: self.y as f64,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Point2D {
-    x: f64,
-    y: f64,
-}
-
-impl Point2D {
-    #[allow(dead_code)]
-    const fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
-    }
-
-    fn to_i32(&self) -> Point {
-        Point::new(self.x.round() as i32, self.y.round() as i32)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Vector2D {
-    x: f64,
-    y: f64,
-}
-
-impl Vector2D {
-    fn new(p1: Point2D, p2: Point2D) -> Self {
-        Self {
-            x: p2.x - p1.x,
-            y: p2.y - p1.y,
-        }
-    }
-
-    fn abs2(&self) -> f64 {
-        self.x.mul_add(self.x, self.y * self.y)
-    }
-
-    #[allow(dead_code)]
-    fn dot(&self, other: &Self) -> f64 {
-        self.x.mul_add(other.x, self.y * other.y)
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Contour {
-    points: Vec<Point>,
-    simplified_points: Vec<Point>,
     chain_code: Vec<u8>,
     start_point: Point,
     is_outer: bool,
     parent_id: Option<usize>,
-    simplification_ratio: f64,
+}
+
+impl Contour {
+    // Reconstruct all points from chain code
+    pub fn reconstruct_points(&self) -> Vec<Point> {
+        if self.chain_code.is_empty() {
+            return vec![self.start_point];
+        }
+
+        let mut points = Vec::with_capacity(self.chain_code.len() + 1);
+        let mut current = self.start_point;
+        points.push(current);
+
+        for &direction in &self.chain_code {
+            // 4-connected directions: 0=right, 1=up, 2=left, 3=down
+            match direction {
+                0 => current.x += 1, // right
+                1 => current.y -= 1, // up
+                2 => current.x -= 1, // left
+                3 => current.y += 1, // down
+                _ => continue,       // ignore invalid directions
+            }
+            points.push(current);
+        }
+
+        points
+    }
 }
 
 #[derive(Debug)]
@@ -93,160 +65,6 @@ impl ContourEncoder {
             target_width,
             target_height,
         }
-    }
-
-    // Ramer-Douglas-Peucker algorithm implementation
-    fn distance_point_to_line_squared(
-        &self,
-        point: Point2D,
-        line_start: Point2D,
-        line_end: Point2D,
-    ) -> f64 {
-        let line_vec = Vector2D::new(line_start, line_end);
-        let line_length_squared = line_vec.abs2();
-
-        if line_length_squared == 0.0 {
-            // Line is actually a point, return distance to that point
-            let vec_to_point = Vector2D::new(line_start, point);
-            return vec_to_point.abs2();
-        }
-
-        // Using the 2D optimized formula from the C++ implementation
-        let dist = line_vec.x.mul_add(
-            line_start.y - point.y,
-            -(line_vec.y * (line_start.x - point.x)),
-        );
-        let dist_squared = dist * dist;
-
-        // Normalize by line length squared for proper distance
-        dist_squared / line_length_squared
-    }
-
-    fn find_most_distant_point(
-        &self,
-        points: &[Point2D],
-        start_idx: usize,
-        end_idx: usize,
-    ) -> (f64, usize) {
-        assert!(
-            start_idx < end_idx,
-            "Start index must be smaller than end index"
-        );
-        assert!(
-            end_idx < points.len(),
-            "End index is larger than the number of points"
-        );
-        assert!(points.len() >= 2, "At least two points needed");
-
-        let line_start = points[start_idx];
-        let line_end = points[end_idx];
-
-        let mut max_dist_squared = 0.0;
-        let mut max_dist_index = start_idx;
-
-        for i in (start_idx + 1)..end_idx {
-            let dist_squared = self.distance_point_to_line_squared(points[i], line_start, line_end);
-
-            if dist_squared > max_dist_squared {
-                max_dist_squared = dist_squared;
-                max_dist_index = i;
-            }
-        }
-
-        (max_dist_squared, max_dist_index)
-    }
-
-    fn ramer_douglas_peucker_recursive(
-        &self,
-        points: &[Point2D],
-        start_idx: usize,
-        end_idx: usize,
-        epsilon_squared: f64,
-        indices_to_keep: &mut Vec<usize>,
-    ) {
-        assert!(
-            start_idx < end_idx,
-            "Start index must be smaller than end index"
-        );
-        assert!(
-            end_idx < points.len(),
-            "End index is larger than the number of points"
-        );
-        assert!(
-            epsilon_squared >= 0.0,
-            "epsilon_squared must be non-negative"
-        );
-
-        let (max_dist_squared, max_dist_index) =
-            self.find_most_distant_point(points, start_idx, end_idx);
-
-        if max_dist_squared > epsilon_squared {
-            // Point is far enough, recursively simplify both segments
-            self.ramer_douglas_peucker_recursive(
-                points,
-                start_idx,
-                max_dist_index,
-                epsilon_squared,
-                indices_to_keep,
-            );
-            self.ramer_douglas_peucker_recursive(
-                points,
-                max_dist_index,
-                end_idx,
-                epsilon_squared,
-                indices_to_keep,
-            );
-        } else {
-            // All points between start and end are close enough, keep only the end point
-            indices_to_keep.push(end_idx);
-        }
-    }
-
-    fn simplify_contour(&self, points: &[Point]) -> Vec<Point> {
-        if points.len() <= 2 {
-            return points.to_vec();
-        }
-
-        // Convert to f64 points for processing
-        let f64_points: Vec<Point2D> = points.iter().map(Point::to_f64).collect();
-        let epsilon_squared = EPSILON_SQUARED;
-
-        let mut indices_to_keep = vec![0]; // Always keep the first point
-
-        // For closed contours, we need to handle the wraparound
-        let is_closed = points.first() == points.last();
-        let end_idx = if is_closed && points.len() > 2 {
-            points.len() - 2 // Skip the duplicate last point
-        } else {
-            points.len() - 1
-        };
-
-        if end_idx > 0 {
-            self.ramer_douglas_peucker_recursive(
-                &f64_points,
-                0,
-                end_idx,
-                epsilon_squared,
-                &mut indices_to_keep,
-            );
-        }
-
-        // Sort indices and remove duplicates
-        indices_to_keep.sort_unstable();
-        indices_to_keep.dedup();
-
-        // Convert back to i32 points
-        let mut simplified: Vec<Point> = indices_to_keep
-            .iter()
-            .map(|&idx| f64_points[idx].to_i32())
-            .collect();
-
-        // For closed contours, ensure the last point equals the first
-        if is_closed && !simplified.is_empty() && simplified.first() != simplified.last() {
-            simplified.push(simplified[0]);
-        }
-
-        simplified
     }
 
     pub fn encode_image(
@@ -613,23 +431,13 @@ impl ContourEncoder {
         is_outer: bool,
         parent_id: Option<usize>,
     ) -> Contour {
-        let simplified_points = self.simplify_contour(points);
         let chain_code = self.points_to_chain_code(points);
-
-        let simplification_ratio = if simplified_points.is_empty() {
-            1.0
-        } else {
-            points.len() as f64 / simplified_points.len() as f64
-        };
 
         Contour {
             start_point: points[0],
-            points: points.to_owned(),
-            simplified_points,
             chain_code,
             is_outer,
             parent_id,
-            simplification_ratio,
         }
     }
 
@@ -703,31 +511,19 @@ impl ContourEncoder {
             overlay.put_pixel(x, y, Rgb([gray_val, gray_val, gray_val]));
         }
 
-        // Draw both original and simplified contours
+        // Draw contours reconstructed from chain codes
         for contour in contours {
-            // Draw original contour - thinner, more transparent
-            let original_color = if contour.is_outer {
-                Rgb([150, 0, 0]) // dark red for original outer boundaries
+            let reconstructed_points = contour.reconstruct_points();
+
+            let color = if contour.is_outer {
+                Rgb([255, 0, 0]) // red for outer boundaries
             } else {
-                Rgb([0, 0, 150]) // dark blue for original holes
+                Rgb([0, 0, 255]) // blue for holes
             };
 
-            for point in &contour.points {
+            for point in &reconstructed_points {
                 if self.is_valid_coord(point.x, point.y) {
-                    overlay.put_pixel(point.x as u32, point.y as u32, original_color);
-                }
-            }
-
-            // Draw simplified contour - brighter, more prominent
-            let simplified_color = if contour.is_outer {
-                Rgb([255, 0, 0]) // bright red for simplified outer boundaries
-            } else {
-                Rgb([0, 0, 255]) // bright blue for simplified holes
-            };
-
-            for point in &contour.simplified_points {
-                if self.is_valid_coord(point.x, point.y) {
-                    overlay.put_pixel(point.x as u32, point.y as u32, simplified_color);
+                    overlay.put_pixel(point.x as u32, point.y as u32, color);
                 }
             }
         }
@@ -743,9 +539,11 @@ impl ContourEncoder {
             *pixel = Luma([0u8]);
         }
 
-        // Draw only simplified contours in white
+        // Draw contours reconstructed from chain codes in white
         for contour in contours {
-            for point in &contour.simplified_points {
+            let reconstructed_points = contour.reconstruct_points();
+
+            for point in &reconstructed_points {
                 if self.is_valid_coord(point.x, point.y) {
                     contour_img.put_pixel(point.x as u32, point.y as u32, Luma([255u8]));
                 }
@@ -756,7 +554,7 @@ impl ContourEncoder {
     }
 
     pub fn print_chain_codes(&self, contours: &[Contour]) {
-        println!("=== Contour Analysis with Douglas-Peucker Simplification ===");
+        println!("=== Contour Analysis with Chain Code Encoding ===");
         println!();
 
         for (i, contour) in contours.iter().enumerate() {
@@ -772,11 +570,12 @@ impl ContourEncoder {
                 contour.start_point.x, contour.start_point.y
             );
 
-            // Original contour stats
-            println!("  Original: {} points", contour.points.len());
-            println!("    Chain code length: {}", contour.chain_code.len());
+            // Chain code stats
+            let reconstructed_points = contour.reconstruct_points();
+            println!("  Reconstructed points: {}", reconstructed_points.len());
+            println!("  Chain code length: {}", contour.chain_code.len());
             println!(
-                "    Chain code: {:?}",
+                "  Chain code: {:?}",
                 if contour.chain_code.len() > 20 {
                     format!("{:?}...", &contour.chain_code[..20])
                 } else {
@@ -784,68 +583,57 @@ impl ContourEncoder {
                 }
             );
 
-            // Simplified contour stats
-            println!(
-                "  Simplified: {} points (reduction: {:.1}x)",
-                contour.simplified_points.len(),
-                contour.simplification_ratio
-            );
+            // Storage analysis
+            let coordinate_storage_bits = reconstructed_points.len() * 16; // 2 bytes per point
+            let chain_code_storage_bits = 16 + (contour.chain_code.len() * 2); // start point + 2 bits per direction
 
-            // Compression analysis
-            let original_coordinate_bits = contour.points.len() * 16; // 2 bytes per coordinate
-            let original_chain_bits = 16 + (contour.chain_code.len() * 2); // start point + 2 bits per direction
-            let simplified_coordinate_bits = contour.simplified_points.len() * 16;
-
-            let coordinate_compression_ratio = if simplified_coordinate_bits > 0 {
-                original_coordinate_bits as f64 / simplified_coordinate_bits as f64
+            let compression_ratio = if chain_code_storage_bits > 0 {
+                coordinate_storage_bits as f64 / chain_code_storage_bits as f64
             } else {
                 1.0
             };
 
-            println!("  Compression Analysis:");
+            println!("  Storage Analysis:");
             println!(
-                "    Coordinates: {original_coordinate_bits} -> {simplified_coordinate_bits} bits (ratio: {coordinate_compression_ratio:.2}x)"
+                "    Coordinates: {} bits ({} bytes)",
+                coordinate_storage_bits,
+                coordinate_storage_bits / 8
             );
-            println!("    Chain codes: {original_chain_bits} bits (no simplification)");
-
-            let best_original = original_coordinate_bits.min(original_chain_bits);
-            let best_simplified = simplified_coordinate_bits;
-            let best_compression_ratio = if best_simplified > 0 {
-                best_original as f64 / best_simplified as f64
-            } else {
-                1.0
-            };
-
             println!(
-                "    Best encoding: {best_original} -> {best_simplified} bits (ratio: {best_compression_ratio:.2}x)"
+                "    Chain codes: {} bits ({} bytes)",
+                chain_code_storage_bits,
+                (chain_code_storage_bits + 7) / 8
             );
+            println!("    Compression ratio: {:.2}x", compression_ratio);
             println!("  ---");
         }
 
         // Overall statistics
-        let total_original_points: usize = contours.iter().map(|c| c.points.len()).sum();
-        let total_simplified_points: usize =
-            contours.iter().map(|c| c.simplified_points.len()).sum();
-        let overall_simplification_ratio = if total_simplified_points > 0 {
-            total_original_points as f64 / total_simplified_points as f64
+        let total_reconstructed_points: usize =
+            contours.iter().map(|c| c.reconstruct_points().len()).sum();
+        let total_chain_code_length: usize = contours.iter().map(|c| c.chain_code.len()).sum();
+
+        let total_coordinate_bits = total_reconstructed_points * 16;
+        let total_chain_code_bits = contours.len() * 16 + total_chain_code_length * 2; // start points + chain codes
+
+        let overall_compression_ratio = if total_chain_code_bits > 0 {
+            total_coordinate_bits as f64 / total_chain_code_bits as f64
         } else {
             1.0
         };
 
         println!("=== Overall Statistics ===");
         println!("Total contours: {}", contours.len());
+        println!("Total reconstructed points: {}", total_reconstructed_points);
+        println!("Total chain code length: {}", total_chain_code_length);
         println!(
-            "Total points: {total_original_points} -> {total_simplified_points} (reduction: {overall_simplification_ratio:.2}x)"
+            "Storage: {} bits -> {} bits (compression: {:.2}x)",
+            total_coordinate_bits, total_chain_code_bits, overall_compression_ratio
         );
-
-        let total_memory_original = total_original_points * 16; // bits
-        let total_memory_simplified = total_simplified_points * 16; // bits
         println!(
-            "Memory usage: {} -> {} bits ({:.1} KB -> {:.1} KB)",
-            total_memory_original,
-            total_memory_simplified,
-            total_memory_original as f64 / 8192.0,
-            total_memory_simplified as f64 / 8192.0
+            "Memory usage: {:.1} KB -> {:.1} KB",
+            total_coordinate_bits as f64 / 8192.0,
+            total_chain_code_bits as f64 / 8192.0
         );
     }
 }
