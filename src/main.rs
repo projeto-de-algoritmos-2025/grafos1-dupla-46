@@ -1,8 +1,10 @@
-use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
+use image::{GrayImage, ImageBuffer, Luma};
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const EPSILON: f64 = 3.0;
-
 const EPSILON_SQUARED: f64 = EPSILON * EPSILON;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,15 +67,158 @@ impl Vector2D {
     }
 }
 
+// Packed chain code structure for efficient storage
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PackedChainCode {
+    pub data: Vec<u32>, // Each u32 stores up to 16 directions (2 bits each)
+    pub length: usize,  // Actual number of direction codes
+}
+
+impl PackedChainCode {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            length: 0,
+        }
+    }
+
+    pub fn from_directions(directions: &[u8]) -> Self {
+        let mut packed = Self::new();
+        packed.pack_directions(directions);
+        packed
+    }
+
+    fn pack_directions(&mut self, directions: &[u8]) {
+        self.length = directions.len();
+        self.data.clear();
+
+        if directions.is_empty() {
+            return;
+        }
+
+        // Calculate how many u32s we need (16 directions per u32)
+        let num_u32s = (directions.len() + 15) / 16;
+        self.data.reserve(num_u32s);
+
+        let mut current_u32 = 0u32;
+        let mut bit_position = 0;
+
+        for &direction in directions {
+            // Pack 2 bits for each direction
+            current_u32 |= (direction as u32 & 0b11) << bit_position;
+            bit_position += 2;
+
+            // If we've filled 16 directions (32 bits), store and start new u32
+            if bit_position >= 32 {
+                self.data.push(current_u32);
+                current_u32 = 0;
+                bit_position = 0;
+            }
+        }
+
+        // Store the last partially filled u32 if needed
+        if bit_position > 0 {
+            self.data.push(current_u32);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn unpack_directions(&self) -> Vec<u8> {
+        let mut directions = Vec::with_capacity(self.length);
+
+        for (chunk_idx, &packed_data) in self.data.iter().enumerate() {
+            for bit_pos in (0..32).step_by(2) {
+                let direction_idx = chunk_idx * 16 + bit_pos / 2;
+                if direction_idx >= self.length {
+                    break;
+                }
+
+                let direction = ((packed_data >> bit_pos) & 0b11) as u8;
+                directions.push(direction);
+            }
+        }
+
+        directions
+    }
+
+    pub fn bits_used(&self) -> usize {
+        self.data.len() * 32
+    }
+
+    pub fn compression_ratio(&self) -> f64 {
+        if self.length == 0 {
+            return 1.0;
+        }
+        (self.length * 8) as f64 / self.bits_used() as f64
+    }
+}
+
+// Serializable structures for pot encoding
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SerializablePoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<Point> for SerializablePoint {
+    fn from(point: Point) -> Self {
+        Self {
+            x: point.x,
+            y: point.y,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SerializableContour {
+    pub chain_code: PackedChainCode,
+    pub start_point: SerializablePoint,
+    pub is_outer: bool,
+    pub parent_id: Option<usize>,
+    pub point_count: usize, // Original number of points before simplification
+    pub simplified_count: usize, // Number of points after simplification
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ImageContours {
+    pub filename: String,
+    pub width: u32,
+    pub height: u32,
+    pub target_width: u32,
+    pub target_height: u32,
+    pub was_inverted: bool,
+    pub contours: Vec<SerializableContour>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ContourDatabase {
+    pub images: Vec<ImageContours>,
+    pub encoder_version: String,
+    pub epsilon: f64,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Contour {
     points: Vec<Point>,
     simplified_points: Vec<Point>,
-    chain_code: Vec<u8>,
+    chain_code: PackedChainCode,
     start_point: Point,
     is_outer: bool,
     parent_id: Option<usize>,
-    simplification_ratio: f64,
+}
+
+impl Contour {
+    fn to_serializable(&self) -> SerializableContour {
+        SerializableContour {
+            chain_code: self.chain_code.clone(),
+            start_point: self.start_point.into(),
+            is_outer: self.is_outer,
+            parent_id: self.parent_id,
+            point_count: self.points.len(),
+            simplified_count: self.simplified_points.len(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -251,8 +396,8 @@ impl ContourEncoder {
 
     pub fn encode_image(
         &mut self,
-        image_path: &str,
-    ) -> Result<(RgbImage, GrayImage), Box<dyn std::error::Error>> {
+        image_path: &Path,
+    ) -> Result<ImageContours, Box<dyn std::error::Error>> {
         // Load and preprocess the image
         let img = image::open(image_path)?;
         let gray_img = img.to_luma8();
@@ -271,21 +416,41 @@ impl ContourEncoder {
         // Detect if the image is inverted (more white than black pixels)
         let is_inverted = self.detect_inversion(&resized);
 
-        println!("Image dimensions: {}x{}", self.width, self.height);
-        println!("Image is inverted: {is_inverted}");
+        println!(
+            "Processing: {} ({}x{}, inverted: {})",
+            image_path.display(),
+            self.width,
+            self.height,
+            is_inverted
+        );
 
         // Convert to binary and invert if necessary
         let binary_img = self.to_binary(&resized, is_inverted);
 
         // Find contours using Suzuki-Abe algorithm
         let contours = self.find_contours_suzuki_abe(&binary_img);
-        println!("Found {} contours", contours.len());
 
-        // Generate output images
-        let overlay_img = self.create_overlay_image(&resized, &contours);
-        let contour_only_img = self.create_contour_only_image(&contours);
+        println!("  Found {} contours", contours.len());
 
-        Ok((overlay_img, contour_only_img))
+        // Convert to serializable format
+        let serializable_contours: Vec<SerializableContour> =
+            contours.iter().map(|c| c.to_serializable()).collect();
+
+        let filename = image_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        Ok(ImageContours {
+            filename,
+            width: self.width,
+            height: self.height,
+            target_width: self.target_width,
+            target_height: self.target_height,
+            was_inverted: is_inverted,
+            contours: serializable_contours,
+        })
     }
 
     fn detect_inversion(&self, img: &GrayImage) -> bool {
@@ -616,12 +781,6 @@ impl ContourEncoder {
         let simplified_points = self.simplify_contour(points);
         let chain_code = self.points_to_chain_code(points);
 
-        let simplification_ratio = if simplified_points.is_empty() {
-            1.0
-        } else {
-            points.len() as f64 / simplified_points.len() as f64
-        };
-
         Contour {
             start_point: points[0],
             points: points.to_owned(),
@@ -629,7 +788,6 @@ impl ContourEncoder {
             chain_code,
             is_outer,
             parent_id,
-            simplification_ratio,
         }
     }
 
@@ -669,8 +827,8 @@ impl ContourEncoder {
         }
     }
 
-    fn points_to_chain_code(&self, points: &[Point]) -> Vec<u8> {
-        let mut chain_code = Vec::new();
+    fn points_to_chain_code(&self, points: &[Point]) -> PackedChainCode {
+        let mut directions = Vec::new();
 
         for i in 0..points.len() {
             let curr = points[i];
@@ -688,208 +846,197 @@ impl ContourEncoder {
                 _ => continue, // skip diagonal or invalid moves
             };
 
-            chain_code.push(code);
+            directions.push(code);
         }
 
-        chain_code
+        PackedChainCode::from_directions(&directions)
     }
 
-    fn create_overlay_image(&self, base_img: &GrayImage, contours: &[Contour]) -> RgbImage {
-        let mut overlay = RgbImage::new(self.width, self.height);
-
-        // Copy base image as grayscale
-        for (x, y, pixel) in base_img.enumerate_pixels() {
-            let gray_val = pixel[0];
-            overlay.put_pixel(x, y, Rgb([gray_val, gray_val, gray_val]));
+    pub fn encode_directory(
+        &mut self,
+        directory_path: &str,
+    ) -> Result<ContourDatabase, Box<dyn std::error::Error>> {
+        let dir_path = Path::new(directory_path);
+        if !dir_path.is_dir() {
+            return Err(format!("Path '{}' is not a directory", directory_path).into());
         }
 
-        // Draw both original and simplified contours
-        for contour in contours {
-            // Draw original contour - thinner, more transparent
-            let original_color = if contour.is_outer {
-                Rgb([150, 0, 0]) // dark red for original outer boundaries
-            } else {
-                Rgb([0, 0, 150]) // dark blue for original holes
-            };
+        println!("Scanning directory: {}", directory_path);
 
-            for point in &contour.points {
-                if self.is_valid_coord(point.x, point.y) {
-                    overlay.put_pixel(point.x as u32, point.y as u32, original_color);
-                }
-            }
+        // Find all PNG files in the directory
+        let mut png_files = Vec::new();
+        for entry in fs::read_dir(dir_path)? {
+            let entry = entry?;
+            let path = entry.path();
 
-            // Draw simplified contour - brighter, more prominent
-            let simplified_color = if contour.is_outer {
-                Rgb([255, 0, 0]) // bright red for simplified outer boundaries
-            } else {
-                Rgb([0, 0, 255]) // bright blue for simplified holes
-            };
-
-            for point in &contour.simplified_points {
-                if self.is_valid_coord(point.x, point.y) {
-                    overlay.put_pixel(point.x as u32, point.y as u32, simplified_color);
+            if path.is_file() {
+                if let Some(extension) = path.extension() {
+                    if extension.to_ascii_lowercase() == "png" {
+                        png_files.push(path);
+                    }
                 }
             }
         }
 
-        overlay
-    }
-
-    fn create_contour_only_image(&self, contours: &[Contour]) -> GrayImage {
-        let mut contour_img = GrayImage::new(self.width, self.height);
-
-        // Initialize with black background
-        for pixel in contour_img.pixels_mut() {
-            *pixel = Luma([0u8]);
+        if png_files.is_empty() {
+            return Err("No PNG files found in the directory".into());
         }
 
-        // Draw only simplified contours in white
-        for contour in contours {
-            for point in &contour.simplified_points {
-                if self.is_valid_coord(point.x, point.y) {
-                    contour_img.put_pixel(point.x as u32, point.y as u32, Luma([255u8]));
+        png_files.sort(); // Sort for consistent ordering
+        println!("Found {} PNG files", png_files.len());
+
+        // Process each PNG file
+        let mut images = Vec::new();
+        let mut total_contours = 0;
+        let mut total_original_points = 0;
+        let mut total_simplified_points = 0;
+        let mut total_chain_code_bits = 0;
+        let mut total_uncompressed_chain_bits = 0;
+
+        for png_file in &png_files {
+            match self.encode_image(png_file) {
+                Ok(image_contours) => {
+                    // Collect statistics
+                    total_contours += image_contours.contours.len();
+                    for contour in &image_contours.contours {
+                        total_original_points += contour.point_count;
+                        total_simplified_points += contour.simplified_count;
+                        total_chain_code_bits += contour.chain_code.bits_used();
+                        total_uncompressed_chain_bits += contour.chain_code.length * 8; // 8 bits per u8
+                    }
+
+                    println!("  {} contours processed", image_contours.contours.len());
+                    images.push(image_contours);
+                }
+                Err(e) => {
+                    eprintln!("Error processing {}: {}", png_file.display(), e);
+                    continue;
                 }
             }
         }
 
-        contour_img
-    }
-
-    pub fn print_chain_codes(&self, contours: &[Contour]) {
-        println!("=== Contour Analysis with Douglas-Peucker Simplification ===");
-        println!();
-
-        for (i, contour) in contours.iter().enumerate() {
-            let boundary_type = if contour.is_outer { "Outer" } else { "Hole" };
-            let parent_info = match contour.parent_id {
-                Some(pid) => format!("Parent: {pid}"),
-                None => "Root".to_string(),
-            };
-
-            println!("Contour {i}: {boundary_type} boundary, {parent_info}");
-            println!(
-                "  Start Point: ({}, {})",
-                contour.start_point.x, contour.start_point.y
-            );
-
-            // Original contour stats
-            println!("  Original: {} points", contour.points.len());
-            println!("    Chain code length: {}", contour.chain_code.len());
-            println!(
-                "    Chain code: {:?}",
-                if contour.chain_code.len() > 20 {
-                    format!("{:?}...", &contour.chain_code[..20])
-                } else {
-                    format!("{:?}", contour.chain_code)
-                }
-            );
-
-            // Simplified contour stats
-            println!(
-                "  Simplified: {} points (reduction: {:.1}x)",
-                contour.simplified_points.len(),
-                contour.simplification_ratio
-            );
-
-            // Compression analysis
-            let original_coordinate_bits = contour.points.len() * 16; // 2 bytes per coordinate
-            let original_chain_bits = 16 + (contour.chain_code.len() * 2); // start point + 2 bits per direction
-            let simplified_coordinate_bits = contour.simplified_points.len() * 16;
-
-            let coordinate_compression_ratio = if simplified_coordinate_bits > 0 {
-                original_coordinate_bits as f64 / simplified_coordinate_bits as f64
+        println!("\n=== Overall Statistics ===");
+        println!("Total images processed: {}", images.len());
+        println!("Total contours: {}", total_contours);
+        println!(
+            "Total points: {} -> {} (reduction: {:.2}x)",
+            total_original_points,
+            total_simplified_points,
+            if total_simplified_points > 0 {
+                total_original_points as f64 / total_simplified_points as f64
             } else {
                 1.0
-            };
+            }
+        );
 
-            println!("  Compression Analysis:");
-            println!(
-                "    Coordinates: {original_coordinate_bits} -> {simplified_coordinate_bits} bits (ratio: {coordinate_compression_ratio:.2}x)"
-            );
-            println!("    Chain codes: {original_chain_bits} bits (no simplification)");
-
-            let best_original = original_coordinate_bits.min(original_chain_bits);
-            let best_simplified = simplified_coordinate_bits;
-            let best_compression_ratio = if best_simplified > 0 {
-                best_original as f64 / best_simplified as f64
-            } else {
-                1.0
-            };
-
-            println!(
-                "    Best encoding: {best_original} -> {best_simplified} bits (ratio: {best_compression_ratio:.2}x)"
-            );
-            println!("  ---");
-        }
-
-        // Overall statistics
-        let total_original_points: usize = contours.iter().map(|c| c.points.len()).sum();
-        let total_simplified_points: usize =
-            contours.iter().map(|c| c.simplified_points.len()).sum();
-        let overall_simplification_ratio = if total_simplified_points > 0 {
-            total_original_points as f64 / total_simplified_points as f64
+        let chain_compression_ratio = if total_chain_code_bits > 0 {
+            total_uncompressed_chain_bits as f64 / total_chain_code_bits as f64
         } else {
             1.0
         };
 
-        println!("=== Overall Statistics ===");
-        println!("Total contours: {}", contours.len());
         println!(
-            "Total points: {total_original_points} -> {total_simplified_points} (reduction: {overall_simplification_ratio:.2}x)"
+            "Chain code compression: {} -> {} bits ({:.2}x reduction)",
+            total_uncompressed_chain_bits, total_chain_code_bits, chain_compression_ratio
         );
 
-        let total_memory_original = total_original_points * 16; // bits
-        let total_memory_simplified = total_simplified_points * 16; // bits
-        println!(
-            "Memory usage: {} -> {} bits ({:.1} KB -> {:.1} KB)",
-            total_memory_original,
-            total_memory_simplified,
-            total_memory_original as f64 / 8192.0,
-            total_memory_simplified as f64 / 8192.0
-        );
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let database = ContourDatabase {
+            images,
+            encoder_version: "1.0".to_string(),
+            epsilon: EPSILON,
+            created_at: timestamp,
+        };
+
+        Ok(database)
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} <image_path>", args[0]);
+        eprintln!("Usage: {} <directory_path>", args[0]);
+        eprintln!("This will process all PNG files in the directory and create a .pot file");
         std::process::exit(1);
     }
 
-    let image_path = &args[1];
+    let directory_path = &args[1];
     let mut encoder = ContourEncoder::new(180, 135);
 
-    match encoder.encode_image(image_path) {
-        Ok((overlay_img, contour_only_img)) => {
-            // Save output images
-            let base_name = Path::new(image_path).file_stem().unwrap().to_str().unwrap();
+    println!("=== Contour Encoder with Pot Serialization ===");
+    println!("Target resolution: {}x{}", 180, 135);
+    println!("Douglas-Peucker epsilon: {}", EPSILON);
+    println!();
 
-            let overlay_path = format!("{base_name}_overlay.png");
-            let contour_path = format!("{base_name}_contour.png");
+    match encoder.encode_directory(directory_path) {
+        Ok(database) => {
+            // Serialize to pot format
+            let serialized = pot::to_vec(&database)?;
 
-            overlay_img.save(&overlay_path)?;
-            contour_only_img.save(&contour_path)?;
+            // Create output filename
+            let dir_path = Path::new(directory_path);
+            let dir_name = dir_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("contours");
+            let output_filename = format!("{}_contours.pot", dir_name);
 
-            println!("Saved overlay image to: {overlay_path}");
-            println!("Saved contour image to: {contour_path}");
+            // Save to file
+            fs::write(&output_filename, &serialized)?;
 
-            // For demonstration, let's find contours again to print chain codes
-            let gray_img = image::open(image_path)?.to_luma8();
-            let resized = image::imageops::resize(
-                &gray_img,
-                encoder.target_width,
-                encoder.target_height,
-                image::imageops::FilterType::Nearest,
+            println!("\n=== Serialization Complete ===");
+            println!("Output file: {}", output_filename);
+            println!("File size: {:.1} KB", serialized.len() as f64 / 1024.0);
+            println!(
+                "Compression ratio: {:.2}x",
+                (database.images.len() * 180 * 135 * 3) as f64 / serialized.len() as f64
             );
-            let is_inverted = encoder.detect_inversion(&resized);
-            let binary_img = encoder.to_binary(&resized, is_inverted);
-            let contours = encoder.find_contours_suzuki_abe(&binary_img);
 
-            encoder.print_chain_codes(&contours);
+            // Print details about chain code efficiency
+            let total_packed_chain_bits: usize = database
+                .images
+                .iter()
+                .flat_map(|img| &img.contours)
+                .map(|c| c.chain_code.bits_used())
+                .sum();
+
+            let total_original_chain_bits: usize = database
+                .images
+                .iter()
+                .flat_map(|img| &img.contours)
+                .map(|c| c.chain_code.length * 8) // 8 bits if stored as Vec<u8>
+                .sum();
+
+            println!(
+                "Total chain codes: {} directions",
+                database
+                    .images
+                    .iter()
+                    .flat_map(|img| &img.contours)
+                    .map(|c| c.chain_code.length)
+                    .sum::<usize>()
+            );
+            println!(
+                "Chain code storage: {} bits (vs {} unpacked: {:.2}x compression)",
+                total_packed_chain_bits,
+                total_original_chain_bits,
+                if total_packed_chain_bits > 0 {
+                    total_original_chain_bits as f64 / total_packed_chain_bits as f64
+                } else {
+                    1.0
+                }
+            );
+            println!(
+                "Chain code overhead: {:.1} KB",
+                total_packed_chain_bits as f64 / 8192.0
+            );
         }
         Err(e) => {
-            eprintln!("Error processing image: {e}");
+            eprintln!("Error processing directory: {}", e);
             std::process::exit(1);
         }
     }
