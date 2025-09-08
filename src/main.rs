@@ -49,6 +49,23 @@ impl Contour {
     }
 }
 
+// New structure for isolated pixels
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IsolatedPixel {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl IsolatedPixel {
+    pub fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+
+    pub fn to_point(&self) -> Point {
+        Point::new(self.x, self.y)
+    }
+}
+
 // Serializable structures for compact storage
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SerializableContour {
@@ -65,6 +82,7 @@ pub struct FrameData {
     pub width: u32,
     pub height: u32,
     pub contours: Vec<SerializableContour>,
+    pub isolated_pixels: Vec<IsolatedPixel>,
 }
 
 impl SerializableContour {
@@ -172,7 +190,12 @@ impl SerializableContour {
 }
 
 impl FrameData {
-    pub fn from_contours(width: u32, height: u32, contours: &[Contour]) -> Self {
+    pub fn from_contours_and_pixels(
+        width: u32,
+        height: u32,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+    ) -> Self {
         let serializable_contours = contours
             .iter()
             .map(SerializableContour::from_contour)
@@ -182,7 +205,13 @@ impl FrameData {
             width,
             height,
             contours: serializable_contours,
+            isolated_pixels: isolated_pixels.to_vec(),
         }
+    }
+
+    // Legacy method for backward compatibility
+    pub fn from_contours(width: u32, height: u32, contours: &[Contour]) -> Self {
+        Self::from_contours_and_pixels(width, height, contours, &[])
     }
 
     pub fn to_contours(&self) -> Vec<Contour> {
@@ -217,6 +246,7 @@ impl FrameData {
         println!("=== Frame Serialization Statistics ===");
         println!("Image dimensions: {}x{}", self.width, self.height);
         println!("Number of contours: {}", self.contours.len());
+        println!("Number of isolated pixels: {}", self.isolated_pixels.len());
 
         let mut total_original_bits = 0;
         let mut total_compressed_bits = 0;
@@ -231,6 +261,14 @@ impl FrameData {
                 i, orig, comp, ratio
             );
         }
+
+        // Calculate isolated pixels storage
+        let isolated_pixels_bits = self.isolated_pixels.len() * 16;
+        println!(
+            "Isolated pixels storage: {} bits ({} bytes)",
+            isolated_pixels_bits,
+            (isolated_pixels_bits + 7) / 8
+        );
 
         let overall_ratio = if total_compressed_bits > 0 {
             total_original_bits as f64 / total_compressed_bits as f64
@@ -305,14 +343,63 @@ impl ContourEncoder {
         let contours = self.find_contours_suzuki_abe(&binary_img);
         println!("Found {} contours", contours.len());
 
+        // Find isolated pixels
+        let isolated_pixels = self.find_isolated_pixels(&binary_img);
+        println!("Found {} isolated pixels", isolated_pixels.len());
+
         // Create serializable frame data
-        let frame_data = FrameData::from_contours(self.width, self.height, &contours);
+        let frame_data = FrameData::from_contours_and_pixels(
+            self.width,
+            self.height,
+            &contours,
+            &isolated_pixels,
+        );
 
         // Generate output images
-        let overlay_img = self.create_overlay_image(&resized, &contours);
-        let contour_only_img = self.create_contour_only_image(&contours);
+        let overlay_img = self.create_overlay_image(&resized, &contours, &isolated_pixels);
+        let contour_only_img = self.create_contour_only_image(&contours, &isolated_pixels);
 
         Ok((overlay_img, contour_only_img, frame_data))
+    }
+
+    // New method to find isolated pixels
+    fn find_isolated_pixels(&self, binary_img: &GrayImage) -> Vec<IsolatedPixel> {
+        let mut isolated_pixels = Vec::new();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                // Check if this pixel is foreground (value 1)
+                if binary_img.get_pixel(x, y)[0] == 1 {
+                    // Check if it's isolated (no connected foreground neighbors)
+                    if self.is_isolated_pixel(binary_img, x as i32, y as i32) {
+                        isolated_pixels.push(IsolatedPixel::new(x as i32, y as i32));
+                    }
+                }
+            }
+        }
+
+        isolated_pixels
+    }
+
+    // Check if a pixel is isolated (has no 4-connected foreground neighbors)
+    fn is_isolated_pixel(&self, binary_img: &GrayImage, x: i32, y: i32) -> bool {
+        // 4-connected directions: right, up, left, down
+        let directions = [(1, 0), (0, -1), (-1, 0), (0, 1)];
+
+        for (dx, dy) in directions {
+            let nx = x + dx;
+            let ny = y + dy;
+
+            // Check bounds
+            if nx >= 0 && nx < self.width as i32 && ny >= 0 && ny < self.height as i32 {
+                // If any neighbor is foreground, this pixel is not isolated
+                if binary_img.get_pixel(nx as u32, ny as u32)[0] == 1 {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     fn detect_inversion(&self, img: &GrayImage) -> bool {
@@ -711,7 +798,12 @@ impl ContourEncoder {
         chain_code
     }
 
-    fn create_overlay_image(&self, base_img: &GrayImage, contours: &[Contour]) -> RgbImage {
+    fn create_overlay_image(
+        &self,
+        base_img: &GrayImage,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+    ) -> RgbImage {
         let mut overlay = RgbImage::new(self.width, self.height);
 
         // Copy base image as grayscale
@@ -737,10 +829,21 @@ impl ContourEncoder {
             }
         }
 
+        // Draw isolated pixels in green
+        for pixel in isolated_pixels {
+            if self.is_valid_coord(pixel.x, pixel.y) {
+                overlay.put_pixel(pixel.x as u32, pixel.y as u32, Rgb([0, 255, 0]));
+            }
+        }
+
         overlay
     }
 
-    fn create_contour_only_image(&self, contours: &[Contour]) -> GrayImage {
+    fn create_contour_only_image(
+        &self,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+    ) -> GrayImage {
         let mut contour_img = GrayImage::new(self.width, self.height);
 
         // Initialize with black background
@@ -759,10 +862,17 @@ impl ContourEncoder {
             }
         }
 
+        // Draw isolated pixels in white as well
+        for pixel in isolated_pixels {
+            if self.is_valid_coord(pixel.x, pixel.y) {
+                contour_img.put_pixel(pixel.x as u32, pixel.y as u32, Luma([255u8]));
+            }
+        }
+
         contour_img
     }
 
-    pub fn print_chain_codes(&self, contours: &[Contour]) {
+    pub fn print_chain_codes(&self, contours: &[Contour], isolated_pixels: &[IsolatedPixel]) {
         println!("=== Contour Analysis with Chain Code Encoding ===");
         println!();
 
@@ -817,6 +927,33 @@ impl ContourEncoder {
             println!("  ---");
         }
 
+        // Isolated pixels analysis
+        if !isolated_pixels.is_empty() {
+            println!("=== Isolated Pixels Analysis ===");
+            println!("Number of isolated pixels: {}", isolated_pixels.len());
+            let isolated_storage_bits = isolated_pixels.len() * 16; // 2 bytes per point (x, y)
+            println!(
+                "Storage: {} bits ({} bytes)",
+                isolated_storage_bits,
+                (isolated_storage_bits + 7) / 8
+            );
+
+            // Show first few isolated pixels as examples
+            let num_to_show = std::cmp::min(10, isolated_pixels.len());
+            print!("Sample isolated pixels: ");
+            for (i, pixel) in isolated_pixels.iter().take(num_to_show).enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                print!("({}, {})", pixel.x, pixel.y);
+            }
+            if isolated_pixels.len() > num_to_show {
+                print!("...");
+            }
+            println!();
+            println!("  ---");
+        }
+
         // Overall statistics
         let total_reconstructed_points: usize =
             contours.iter().map(|c| c.reconstruct_points().len()).sum();
@@ -824,6 +961,7 @@ impl ContourEncoder {
 
         let total_coordinate_bits = total_reconstructed_points * 16;
         let total_chain_code_bits = contours.len() * 16 + total_chain_code_length * 2; // start points + chain codes
+        let total_isolated_bits = isolated_pixels.len() * 16;
 
         let overall_compression_ratio = if total_chain_code_bits > 0 {
             total_coordinate_bits as f64 / total_chain_code_bits as f64
@@ -833,16 +971,18 @@ impl ContourEncoder {
 
         println!("=== Overall Statistics ===");
         println!("Total contours: {}", contours.len());
+        println!("Total isolated pixels: {}", isolated_pixels.len());
         println!("Total reconstructed points: {}", total_reconstructed_points);
         println!("Total chain code length: {}", total_chain_code_length);
         println!(
-            "Storage: {} bits -> {} bits (compression: {:.2}x)",
+            "Contour storage: {} bits -> {} bits (compression: {:.2}x)",
             total_coordinate_bits, total_chain_code_bits, overall_compression_ratio
         );
+        println!("Isolated pixels storage: {} bits", total_isolated_bits);
         println!(
-            "Memory usage: {:.1} KB -> {:.1} KB",
-            total_coordinate_bits as f64 / 8192.0,
-            total_chain_code_bits as f64 / 8192.0
+            "Total feature storage: {} bits ({:.1} KB)",
+            total_chain_code_bits + total_isolated_bits,
+            (total_chain_code_bits + total_isolated_bits) as f64 / 8192.0
         );
     }
 }
@@ -879,7 +1019,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Print chain codes for analysis
             let contours = frame_data.to_contours();
-            encoder.print_chain_codes(&contours);
+            encoder.print_chain_codes(&contours, &frame_data.isolated_pixels);
         }
         Err(e) => {
             eprintln!("Error processing image: {e}");
