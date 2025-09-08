@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ciborium = "0.2.2"
 image = "0.25.6"
-pot = "3.0.1"
 serde = { version = "1.0.219", features = ["derive"] }

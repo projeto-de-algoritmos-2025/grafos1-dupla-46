@@ -1,11 +1,7 @@
-use image::{GrayImage, ImageBuffer, Luma};
+use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const EPSILON: f64 = 3.0;
-const EPSILON_SQUARED: f64 = EPSILON * EPSILON;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
@@ -16,54 +12,6 @@ pub struct Point {
 impl Point {
     const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
-    }
-
-    const fn to_f64(&self) -> Point2D {
-        Point2D {
-            x: self.x as f64,
-            y: self.y as f64,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Point2D {
-    x: f64,
-    y: f64,
-}
-
-impl Point2D {
-    #[allow(dead_code)]
-    const fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
-    }
-
-    fn to_i32(&self) -> Point {
-        Point::new(self.x.round() as i32, self.y.round() as i32)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Vector2D {
-    x: f64,
-    y: f64,
-}
-
-impl Vector2D {
-    fn new(p1: Point2D, p2: Point2D) -> Self {
-        Self {
-            x: p2.x - p1.x,
-            y: p2.y - p1.y,
-        }
-    }
-
-    fn abs2(&self) -> f64 {
-        self.x.mul_add(self.x, self.y * self.y)
-    }
-
-    #[allow(dead_code)]
-    fn dot(&self, other: &Self) -> f64 {
-        self.x.mul_add(other.x, self.y * other.y)
     }
 }
 
@@ -200,23 +148,351 @@ pub struct ContourDatabase {
 
 #[derive(Debug, Clone)]
 pub struct Contour {
-    points: Vec<Point>,
-    simplified_points: Vec<Point>,
-    chain_code: PackedChainCode,
+    chain_code: Vec<u8>,
     start_point: Point,
     is_outer: bool,
     parent_id: Option<usize>,
 }
 
 impl Contour {
-    fn to_serializable(&self) -> SerializableContour {
-        SerializableContour {
-            chain_code: self.chain_code.clone(),
-            start_point: self.start_point.into(),
+    // Reconstruct all points from chain code
+    pub fn reconstruct_points(&self) -> Vec<Point> {
+        if self.chain_code.is_empty() {
+            return vec![self.start_point];
+        }
+
+        let mut points = Vec::with_capacity(self.chain_code.len() + 1);
+        let mut current = self.start_point;
+        points.push(current);
+
+        for &direction in &self.chain_code {
+            // 4-connected directions: 0=right, 1=up, 2=left, 3=down
+            match direction {
+                0 => current.x += 1, // right
+                1 => current.y -= 1, // up
+                2 => current.x -= 1, // left
+                3 => current.y += 1, // down
+                _ => continue,       // ignore invalid directions
+            }
+            points.push(current);
+        }
+
+        points
+    }
+}
+
+// New structure for isolated pixels
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IsolatedPixel {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl IsolatedPixel {
+    pub fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+
+    pub fn to_point(&self) -> Point {
+        Point::new(self.x, self.y)
+    }
+}
+
+// Seed point for reliable flood fill operations
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SeedPoint {
+    pub x: i32,
+    pub y: i32,
+    pub contour_id: usize, // Which contour this seed belongs to
+}
+
+impl SeedPoint {
+    pub fn new(x: i32, y: i32, contour_id: usize) -> Self {
+        Self { x, y, contour_id }
+    }
+
+    pub fn to_point(&self) -> Point {
+        Point::new(self.x, self.y)
+    }
+}
+
+// Serializable structures for compact storage
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SerializableContour {
+    pub start_x: i32,
+    pub start_y: i32,
+    pub is_outer: bool,
+    pub parent_id: Option<usize>,
+    pub packed_chain_code: Vec<u32>, // Each u32 holds up to 16 directions (2 bits each)
+    pub chain_code_length: usize,    // Original length before packing
+    pub should_fill: bool,           // Whether this region should be filled
+    pub clockwise: bool,             // Winding order of the contour
+    pub area: f64, // Signed area (positive for clockwise, negative for counter-clockwise)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FrameData {
+    pub width: u32,
+    pub height: u32,
+    pub contours: Vec<SerializableContour>,
+    pub isolated_pixels: Vec<IsolatedPixel>, // Isolated single pixels
+    pub seed_points: Vec<SeedPoint>,         // Guaranteed interior points for flood fill
+}
+
+impl SerializableContour {
+    // Convert from internal Contour to serializable format
+    pub fn from_contour_with_analysis(
+        contour: &Contour,
+        should_fill: bool,
+        clockwise: bool,
+        area: f64,
+    ) -> Self {
+        let (packed_chain_code, chain_code_length) = Self::pack_chain_code(&contour.chain_code);
+
+        Self {
+            start_x: contour.start_point.x,
+            start_y: contour.start_point.y,
+            is_outer: contour.is_outer,
+            parent_id: contour.parent_id,
+            packed_chain_code,
+            chain_code_length,
+            should_fill,
+            clockwise,
+            area,
+        }
+    }
+
+    // Legacy method for backward compatibility
+    pub fn from_contour(contour: &Contour) -> Self {
+        Self::from_contour_with_analysis(contour, contour.is_outer, false, 0.0)
+    }
+
+    // Convert back to internal Contour format
+    pub fn to_contour(&self) -> Contour {
+        let chain_code = Self::unpack_chain_code(&self.packed_chain_code, self.chain_code_length);
+
+        Contour {
+            start_point: Point::new(self.start_x, self.start_y),
+            chain_code,
             is_outer: self.is_outer,
             parent_id: self.parent_id,
-            point_count: self.points.len(),
-            simplified_count: self.simplified_points.len(),
+        }
+    }
+
+    // Pack chain code directions (0-3) into u32s using 2 bits per direction
+    fn pack_chain_code(chain_code: &[u8]) -> (Vec<u32>, usize) {
+        let original_length = chain_code.len();
+        if original_length == 0 {
+            return (Vec::new(), 0);
+        }
+
+        let mut packed = Vec::new();
+        let mut current_u32 = 0u32;
+        let mut bits_used = 0;
+
+        for &direction in chain_code {
+            // Ensure direction is valid (0-3)
+            let dir = (direction & 0x03) as u32;
+
+            // Shift the direction to its position and add to current u32
+            current_u32 |= dir << bits_used;
+            bits_used += 2;
+
+            // If we've filled the u32 (16 directions * 2 bits = 32 bits), store it
+            if bits_used >= 32 {
+                packed.push(current_u32);
+                current_u32 = 0;
+                bits_used = 0;
+            }
+        }
+
+        // Store any remaining bits
+        if bits_used > 0 {
+            packed.push(current_u32);
+        }
+
+        (packed, original_length)
+    }
+
+    // Unpack chain code from u32s back to Vec<u8>
+    fn unpack_chain_code(packed: &[u32], original_length: usize) -> Vec<u8> {
+        if original_length == 0 {
+            return Vec::new();
+        }
+
+        let mut chain_code = Vec::with_capacity(original_length);
+        let mut remaining = original_length;
+
+        for &packed_u32 in packed {
+            let mut current = packed_u32;
+            let directions_in_this_u32 = std::cmp::min(16, remaining);
+
+            for _ in 0..directions_in_this_u32 {
+                let direction = (current & 0x03) as u8;
+                chain_code.push(direction);
+                current >>= 2;
+            }
+
+            remaining -= directions_in_this_u32;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        chain_code
+    }
+
+    // Calculate compression statistics
+    pub fn compression_stats(&self) -> (usize, usize, f64) {
+        let original_bits = self.chain_code_length * 8; // 1 byte per direction originally
+        let compressed_bits = self.packed_chain_code.len() * 32; // u32s
+        let compression_ratio = if compressed_bits > 0 {
+            original_bits as f64 / compressed_bits as f64
+        } else {
+            1.0
+        };
+
+        (original_bits, compressed_bits, compression_ratio)
+    }
+}
+
+impl FrameData {
+    pub fn from_contours_and_pixels_with_seeds(
+        width: u32,
+        height: u32,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+        seed_points: &[SeedPoint],
+        contour_metadata: &[(bool, bool, f64)], // (should_fill, clockwise, area)
+    ) -> Self {
+        let serializable_contours = contours
+            .iter()
+            .zip(contour_metadata.iter())
+            .map(|(contour, &(should_fill, clockwise, area))| {
+                SerializableContour::from_contour_with_analysis(
+                    contour,
+                    should_fill,
+                    clockwise,
+                    area,
+                )
+            })
+            .collect();
+
+        Self {
+            width,
+            height,
+            contours: serializable_contours,
+            isolated_pixels: isolated_pixels.to_vec(),
+            seed_points: seed_points.to_vec(),
+        }
+    }
+
+    pub fn from_contours_and_pixels(
+        width: u32,
+        height: u32,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+    ) -> Self {
+        Self::from_contours_and_pixels_with_seeds(
+            width,
+            height,
+            contours,
+            isolated_pixels,
+            &[],
+            &[],
+        )
+    }
+
+    // Legacy method for backward compatibility
+    pub fn from_contours(width: u32, height: u32, contours: &[Contour]) -> Self {
+        Self::from_contours_and_pixels(width, height, contours, &[])
+    }
+
+    pub fn to_contours(&self) -> Vec<Contour> {
+        self.contours.iter().map(|sc| sc.to_contour()).collect()
+    }
+
+    // Serialize to binary format using CBOR
+    pub fn serialize(&self) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+        let mut buffer = Vec::new();
+        ciborium::ser::into_writer(self, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    // Deserialize from binary format
+    pub fn deserialize(data: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
+        ciborium::de::from_reader(data)
+    }
+
+    // Save to file
+    pub fn save_to_file(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let data = self.serialize()?;
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+
+    // Load from file
+    pub fn load_from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let data = std::fs::read(path)?;
+        Ok(Self::deserialize(&data)?)
+    }
+
+    // Print compression statistics
+    pub fn print_stats(&self) {
+        println!("=== Frame Serialization Statistics ===");
+        println!("Image dimensions: {}x{}", self.width, self.height);
+        println!("Number of contours: {}", self.contours.len());
+        println!("Number of isolated pixels: {}", self.isolated_pixels.len());
+        println!("Number of seed points: {}", self.seed_points.len());
+
+        let mut total_original_bits = 0;
+        let mut total_compressed_bits = 0;
+
+        for (i, contour) in self.contours.iter().enumerate() {
+            let (orig, comp, ratio) = contour.compression_stats();
+            total_original_bits += orig;
+            total_compressed_bits += comp;
+
+            println!(
+                "Contour {}: {} -> {} bits ({}x compression), fill: {}, clockwise: {}, area: {:.1}",
+                i, orig, comp, ratio, contour.should_fill, contour.clockwise, contour.area
+            );
+        }
+
+        // Calculate isolated pixels storage
+        let isolated_pixels_bits = self.isolated_pixels.len() * 16; // 2 bytes per point (x, y)
+        println!(
+            "Isolated pixels storage: {} bits ({} bytes)",
+            isolated_pixels_bits,
+            (isolated_pixels_bits + 7) / 8
+        );
+
+        // Calculate seed points storage
+        let seed_points_bits = self.seed_points.len() * 24; // 3 bytes per seed (x, y, contour_id)
+        println!(
+            "Seed points storage: {} bits ({} bytes)",
+            seed_points_bits,
+            (seed_points_bits + 7) / 8
+        );
+
+        let overall_ratio = if total_compressed_bits > 0 {
+            total_original_bits as f64 / total_compressed_bits as f64
+        } else {
+            1.0
+        };
+
+        println!(
+            "Overall chain code compression: {} -> {} bits ({:.2}x)",
+            total_original_bits, total_compressed_bits, overall_ratio
+        );
+
+        // Estimate total serialized size
+        if let Ok(serialized) = self.serialize() {
+            println!(
+                "Total serialized size: {} bytes ({:.2} KB)",
+                serialized.len(),
+                serialized.len() as f64 / 1024.0
+            );
         }
     }
 }
@@ -240,164 +516,10 @@ impl ContourEncoder {
         }
     }
 
-    // Ramer-Douglas-Peucker algorithm implementation
-    fn distance_point_to_line_squared(
-        &self,
-        point: Point2D,
-        line_start: Point2D,
-        line_end: Point2D,
-    ) -> f64 {
-        let line_vec = Vector2D::new(line_start, line_end);
-        let line_length_squared = line_vec.abs2();
-
-        if line_length_squared == 0.0 {
-            // Line is actually a point, return distance to that point
-            let vec_to_point = Vector2D::new(line_start, point);
-            return vec_to_point.abs2();
-        }
-
-        // Using the 2D optimized formula from the C++ implementation
-        let dist = line_vec.x.mul_add(
-            line_start.y - point.y,
-            -(line_vec.y * (line_start.x - point.x)),
-        );
-        let dist_squared = dist * dist;
-
-        // Normalize by line length squared for proper distance
-        dist_squared / line_length_squared
-    }
-
-    fn find_most_distant_point(
-        &self,
-        points: &[Point2D],
-        start_idx: usize,
-        end_idx: usize,
-    ) -> (f64, usize) {
-        assert!(
-            start_idx < end_idx,
-            "Start index must be smaller than end index"
-        );
-        assert!(
-            end_idx < points.len(),
-            "End index is larger than the number of points"
-        );
-        assert!(points.len() >= 2, "At least two points needed");
-
-        let line_start = points[start_idx];
-        let line_end = points[end_idx];
-
-        let mut max_dist_squared = 0.0;
-        let mut max_dist_index = start_idx;
-
-        for i in (start_idx + 1)..end_idx {
-            let dist_squared = self.distance_point_to_line_squared(points[i], line_start, line_end);
-
-            if dist_squared > max_dist_squared {
-                max_dist_squared = dist_squared;
-                max_dist_index = i;
-            }
-        }
-
-        (max_dist_squared, max_dist_index)
-    }
-
-    fn ramer_douglas_peucker_recursive(
-        &self,
-        points: &[Point2D],
-        start_idx: usize,
-        end_idx: usize,
-        epsilon_squared: f64,
-        indices_to_keep: &mut Vec<usize>,
-    ) {
-        assert!(
-            start_idx < end_idx,
-            "Start index must be smaller than end index"
-        );
-        assert!(
-            end_idx < points.len(),
-            "End index is larger than the number of points"
-        );
-        assert!(
-            epsilon_squared >= 0.0,
-            "epsilon_squared must be non-negative"
-        );
-
-        let (max_dist_squared, max_dist_index) =
-            self.find_most_distant_point(points, start_idx, end_idx);
-
-        if max_dist_squared > epsilon_squared {
-            // Point is far enough, recursively simplify both segments
-            self.ramer_douglas_peucker_recursive(
-                points,
-                start_idx,
-                max_dist_index,
-                epsilon_squared,
-                indices_to_keep,
-            );
-            self.ramer_douglas_peucker_recursive(
-                points,
-                max_dist_index,
-                end_idx,
-                epsilon_squared,
-                indices_to_keep,
-            );
-        } else {
-            // All points between start and end are close enough, keep only the end point
-            indices_to_keep.push(end_idx);
-        }
-    }
-
-    fn simplify_contour(&self, points: &[Point]) -> Vec<Point> {
-        if points.len() <= 2 {
-            return points.to_vec();
-        }
-
-        // Convert to f64 points for processing
-        let f64_points: Vec<Point2D> = points.iter().map(Point::to_f64).collect();
-        let epsilon_squared = EPSILON_SQUARED;
-
-        let mut indices_to_keep = vec![0]; // Always keep the first point
-
-        // For closed contours, we need to handle the wraparound
-        let is_closed = points.first() == points.last();
-        let end_idx = if is_closed && points.len() > 2 {
-            points.len() - 2 // Skip the duplicate last point
-        } else {
-            points.len() - 1
-        };
-
-        if end_idx > 0 {
-            self.ramer_douglas_peucker_recursive(
-                &f64_points,
-                0,
-                end_idx,
-                epsilon_squared,
-                &mut indices_to_keep,
-            );
-        }
-
-        // Sort indices and remove duplicates
-        indices_to_keep.sort_unstable();
-        indices_to_keep.dedup();
-
-        // Convert back to i32 points
-        let mut simplified: Vec<Point> = indices_to_keep
-            .iter()
-            .map(|&idx| f64_points[idx].to_i32())
-            .collect();
-
-        // For closed contours, ensure the last point equals the first
-        if is_closed && !simplified.is_empty() && simplified.first() != simplified.last() {
-            simplified.push(simplified[0]);
-        }
-
-        simplified
-    }
-
     pub fn encode_image(
         &mut self,
-        image_path: &Path,
-    ) -> Result<ImageContours, Box<dyn std::error::Error>> {
+        image_path: &str,
+    ) -> Result<(RgbImage, GrayImage, FrameData), Box<dyn std::error::Error>> {
         // Load and preprocess the image
         let img = image::open(image_path)?;
         let gray_img = img.to_luma8();
@@ -430,27 +552,260 @@ impl ContourEncoder {
         // Find contours using Suzuki-Abe algorithm
         let contours = self.find_contours_suzuki_abe(&binary_img);
 
-        println!("  Found {} contours", contours.len());
+        // Find isolated pixels
+        let isolated_pixels = self.find_isolated_pixels(&binary_img);
+        println!("Found {} isolated pixels", isolated_pixels.len());
 
-        // Convert to serializable format
-        let serializable_contours: Vec<SerializableContour> =
-            contours.iter().map(|c| c.to_serializable()).collect();
+        // Compute geometric properties and seed points for flood fill
+        let (contour_metadata, seed_points) = self.compute_flood_fill_data(&contours);
 
-        let filename = image_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        // Create serializable frame data
+        let frame_data = FrameData::from_contours_and_pixels_with_seeds(
+            self.width,
+            self.height,
+            &contours,
+            &isolated_pixels,
+            &seed_points,
+            &contour_metadata,
+        );
 
-        Ok(ImageContours {
-            filename,
-            width: self.width,
-            height: self.height,
-            target_width: self.target_width,
-            target_height: self.target_height,
-            was_inverted: is_inverted,
-            contours: serializable_contours,
-        })
+        // Generate output images
+        let overlay_img = self.create_overlay_image(&resized, &contours, &isolated_pixels);
+        let contour_only_img = self.create_contour_only_image(&contours, &isolated_pixels);
+
+        Ok((overlay_img, contour_only_img, frame_data))
+    }
+
+    // New method to find isolated pixels
+    fn find_isolated_pixels(&self, binary_img: &GrayImage) -> Vec<IsolatedPixel> {
+        let mut isolated_pixels = Vec::new();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                // Check if this pixel is foreground (value 1)
+                if binary_img.get_pixel(x, y)[0] == 1 {
+                    // Check if it's isolated (no connected foreground neighbors)
+                    if self.is_isolated_pixel(binary_img, x as i32, y as i32) {
+                        isolated_pixels.push(IsolatedPixel::new(x as i32, y as i32));
+                    }
+                }
+            }
+        }
+
+        isolated_pixels
+    }
+
+    // Check if a pixel is isolated (has no 4-connected foreground neighbors)
+    fn is_isolated_pixel(&self, binary_img: &GrayImage, x: i32, y: i32) -> bool {
+        // 4-connected directions: right, up, left, down
+        let directions = [(1, 0), (0, -1), (-1, 0), (0, 1)];
+
+        for (dx, dy) in directions {
+            let nx = x + dx;
+            let ny = y + dy;
+
+            // Check bounds
+            if nx >= 0 && nx < self.width as i32 && ny >= 0 && ny < self.height as i32 {
+                // If any neighbor is foreground, this pixel is not isolated
+                if binary_img.get_pixel(nx as u32, ny as u32)[0] == 1 {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    // Compute flood fill metadata for contours
+    fn compute_flood_fill_data(
+        &self,
+        contours: &[Contour],
+    ) -> (Vec<(bool, bool, f64)>, Vec<SeedPoint>) {
+        let mut metadata = Vec::new();
+        let mut seed_points = Vec::new();
+
+        for (i, contour) in contours.iter().enumerate() {
+            let points = contour.reconstruct_points();
+
+            // Compute signed area and winding order
+            let signed_area = self.compute_signed_area(&points);
+            let clockwise = signed_area < 0.0;
+
+            // Determine if this contour should be filled
+            let should_fill = if contour.is_outer {
+                // Outer contours should be filled if they're oriented correctly
+                // In our coordinate system, clockwise outer contours are typically filled
+                clockwise
+            } else {
+                // Holes (inner contours) should not be filled
+                false
+            };
+
+            // Compute interior seed point for fillable regions
+            if should_fill {
+                if let Some(seed_point) = self.compute_interior_point(&points, i) {
+                    seed_points.push(seed_point);
+                }
+            }
+
+            metadata.push((should_fill, clockwise, signed_area.abs()));
+        }
+
+        (metadata, seed_points)
+    }
+
+    // Compute signed area using shoelace formula
+    fn compute_signed_area(&self, points: &[Point]) -> f64 {
+        if points.len() < 3 {
+            return 0.0;
+        }
+
+        let mut area = 0.0;
+        let n = points.len();
+
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let xi = points[i].x as f64;
+            let yi = points[i].y as f64;
+            let xj = points[j].x as f64;
+            let yj = points[j].y as f64;
+
+            area += xi * yj - xj * yi;
+        }
+
+        area / 2.0
+    }
+
+    // Compute a guaranteed interior point for flood fill
+    fn compute_interior_point(&self, points: &[Point], contour_id: usize) -> Option<SeedPoint> {
+        if points.len() < 3 {
+            return None;
+        }
+
+        // Try centroid first
+        let centroid = self.compute_centroid(points);
+        if self.is_point_inside_polygon(&centroid, points) {
+            return Some(SeedPoint::new(centroid.x, centroid.y, contour_id));
+        }
+
+        // If centroid fails, try the midpoint of the longest edge moved inward
+        let interior_point = self.compute_safe_interior_point(points)?;
+        if self.is_point_inside_polygon(&interior_point, points) {
+            return Some(SeedPoint::new(
+                interior_point.x,
+                interior_point.y,
+                contour_id,
+            ));
+        }
+
+        // Last resort: try multiple points along the boundary
+        self.find_any_interior_point(points, contour_id)
+    }
+
+    // Compute centroid of polygon
+    fn compute_centroid(&self, points: &[Point]) -> Point {
+        let sum_x: i32 = points.iter().map(|p| p.x).sum();
+        let sum_y: i32 = points.iter().map(|p| p.y).sum();
+        let n = points.len() as i32;
+
+        Point::new(sum_x / n, sum_y / n)
+    }
+
+    // Compute a safe interior point by moving inward from the longest edge
+    fn compute_safe_interior_point(&self, points: &[Point]) -> Option<Point> {
+        if points.len() < 3 {
+            return None;
+        }
+
+        // Find the longest edge
+        let mut max_length_sq = 0i32;
+        let mut best_edge = (0, 1);
+
+        for i in 0..points.len() {
+            let j = (i + 1) % points.len();
+            let dx = points[j].x - points[i].x;
+            let dy = points[j].y - points[i].y;
+            let length_sq = dx * dx + dy * dy;
+
+            if length_sq > max_length_sq {
+                max_length_sq = length_sq;
+                best_edge = (i, j);
+            }
+        }
+
+        let (i, j) = best_edge;
+        let midpoint = Point::new(
+            (points[i].x + points[j].x) / 2,
+            (points[i].y + points[j].y) / 2,
+        );
+
+        // Move the midpoint slightly inward (perpendicular to the edge)
+        let edge_dx = points[j].x - points[i].x;
+        let edge_dy = points[j].y - points[i].y;
+
+        // Perpendicular vector (rotated 90 degrees)
+        let perp_dx = -edge_dy;
+        let perp_dy = edge_dx;
+
+        // Normalize and scale the perpendicular vector
+        let length = ((perp_dx * perp_dx + perp_dy * perp_dy) as f64).sqrt();
+        if length > 0.0 {
+            let scale = 1.0 / length; // Move 1 pixel inward
+            let offset_x = (perp_dx as f64 * scale).round() as i32;
+            let offset_y = (perp_dy as f64 * scale).round() as i32;
+
+            Some(Point::new(midpoint.x + offset_x, midpoint.y + offset_y))
+        } else {
+            Some(midpoint)
+        }
+    }
+
+    // Ray casting algorithm for point-in-polygon test
+    fn is_point_inside_polygon(&self, point: &Point, polygon: &[Point]) -> bool {
+        if polygon.len() < 3 {
+            return false;
+        }
+
+        let mut inside = false;
+        let n = polygon.len();
+
+        let mut j = n - 1;
+        for i in 0..n {
+            let xi = polygon[i].x;
+            let yi = polygon[i].y;
+            let xj = polygon[j].x;
+            let yj = polygon[j].y;
+
+            if ((yi > point.y) != (yj > point.y))
+                && (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi)
+            {
+                inside = !inside;
+            }
+            j = i;
+        }
+
+        inside
+    }
+
+    // Find any interior point as a last resort
+    fn find_any_interior_point(&self, points: &[Point], contour_id: usize) -> Option<SeedPoint> {
+        // Try points along edges of the bounding box
+        let min_x = points.iter().map(|p| p.x).min()?;
+        let max_x = points.iter().map(|p| p.x).max()?;
+        let min_y = points.iter().map(|p| p.y).min()?;
+        let max_y = points.iter().map(|p| p.y).max()?;
+
+        // Try points in a grid within the bounding box
+        for y in (min_y + 1)..max_y {
+            for x in (min_x + 1)..max_x {
+                let test_point = Point::new(x, y);
+                if self.is_point_inside_polygon(&test_point, points) {
+                    return Some(SeedPoint::new(x, y, contour_id));
+                }
+            }
+        }
+
+        None
     }
 
     fn detect_inversion(&self, img: &GrayImage) -> bool {
@@ -631,7 +986,7 @@ impl ContourEncoder {
             }
         }
 
-        let mut lnbd = 1i32;
+        let mut lnbd;
         let mut nbd = 1i32;
         let mut contours = Vec::new();
         let mut parents = vec![-1i32]; // parents[i] = parent border number of border i
@@ -778,13 +1133,10 @@ impl ContourEncoder {
         is_outer: bool,
         parent_id: Option<usize>,
     ) -> Contour {
-        let simplified_points = self.simplify_contour(points);
         let chain_code = self.points_to_chain_code(points);
 
         Contour {
             start_point: points[0],
-            points: points.to_owned(),
-            simplified_points,
             chain_code,
             is_outer,
             parent_id,
@@ -852,107 +1204,219 @@ impl ContourEncoder {
         PackedChainCode::from_directions(&directions)
     }
 
-    pub fn encode_directory(
-        &mut self,
-        directory_path: &str,
-    ) -> Result<ContourDatabase, Box<dyn std::error::Error>> {
-        let dir_path = Path::new(directory_path);
-        if !dir_path.is_dir() {
-            return Err(format!("Path '{}' is not a directory", directory_path).into());
+    fn create_overlay_image(
+        &self,
+        base_img: &GrayImage,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+    ) -> RgbImage {
+        let mut overlay = RgbImage::new(self.width, self.height);
+
+        // Copy base image as grayscale
+        for (x, y, pixel) in base_img.enumerate_pixels() {
+            let gray_val = pixel[0];
+            overlay.put_pixel(x, y, Rgb([gray_val, gray_val, gray_val]));
         }
 
-        println!("Scanning directory: {}", directory_path);
+        // Draw contours reconstructed from chain codes
+        for contour in contours {
+            let reconstructed_points = contour.reconstruct_points();
 
-        // Find all PNG files in the directory
-        let mut png_files = Vec::new();
-        for entry in fs::read_dir(dir_path)? {
-            let entry = entry?;
-            let path = entry.path();
+            let color = if contour.is_outer {
+                Rgb([255, 0, 0]) // red for outer boundaries
+            } else {
+                Rgb([0, 0, 255]) // blue for holes
+            };
 
-            if path.is_file() {
-                if let Some(extension) = path.extension() {
-                    if extension.to_ascii_lowercase() == "png" {
-                        png_files.push(path);
-                    }
+            for point in &reconstructed_points {
+                if self.is_valid_coord(point.x, point.y) {
+                    overlay.put_pixel(point.x as u32, point.y as u32, color);
                 }
             }
         }
 
-        if png_files.is_empty() {
-            return Err("No PNG files found in the directory".into());
+        // Draw isolated pixels in green
+        for pixel in isolated_pixels {
+            if self.is_valid_coord(pixel.x, pixel.y) {
+                overlay.put_pixel(pixel.x as u32, pixel.y as u32, Rgb([0, 255, 0]));
+            }
         }
 
-        png_files.sort(); // Sort for consistent ordering
-        println!("Found {} PNG files", png_files.len());
+        overlay
+    }
 
-        // Process each PNG file
-        let mut images = Vec::new();
-        let mut total_contours = 0;
-        let mut total_original_points = 0;
-        let mut total_simplified_points = 0;
-        let mut total_chain_code_bits = 0;
-        let mut total_uncompressed_chain_bits = 0;
+    fn create_contour_only_image(
+        &self,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+    ) -> GrayImage {
+        let mut contour_img = GrayImage::new(self.width, self.height);
 
-        for png_file in &png_files {
-            match self.encode_image(png_file) {
-                Ok(image_contours) => {
-                    // Collect statistics
-                    total_contours += image_contours.contours.len();
-                    for contour in &image_contours.contours {
-                        total_original_points += contour.point_count;
-                        total_simplified_points += contour.simplified_count;
-                        total_chain_code_bits += contour.chain_code.bits_used();
-                        total_uncompressed_chain_bits += contour.chain_code.length * 8; // 8 bits per u8
-                    }
+        // Initialize with black background
+        for pixel in contour_img.pixels_mut() {
+            *pixel = Luma([0u8]);
+        }
 
-                    println!("  {} contours processed", image_contours.contours.len());
-                    images.push(image_contours);
-                }
-                Err(e) => {
-                    eprintln!("Error processing {}: {}", png_file.display(), e);
-                    continue;
+        // Draw contours reconstructed from chain codes in white
+        for contour in contours {
+            let reconstructed_points = contour.reconstruct_points();
+
+            for point in &reconstructed_points {
+                if self.is_valid_coord(point.x, point.y) {
+                    contour_img.put_pixel(point.x as u32, point.y as u32, Luma([255u8]));
                 }
             }
         }
 
-        println!("\n=== Overall Statistics ===");
-        println!("Total images processed: {}", images.len());
-        println!("Total contours: {}", total_contours);
-        println!(
-            "Total points: {} -> {} (reduction: {:.2}x)",
-            total_original_points,
-            total_simplified_points,
-            if total_simplified_points > 0 {
-                total_original_points as f64 / total_simplified_points as f64
+        // Draw isolated pixels in white as well
+        for pixel in isolated_pixels {
+            if self.is_valid_coord(pixel.x, pixel.y) {
+                contour_img.put_pixel(pixel.x as u32, pixel.y as u32, Luma([255u8]));
+            }
+        }
+
+        contour_img
+    }
+
+    pub fn print_chain_codes(
+        &self,
+        contours: &[Contour],
+        isolated_pixels: &[IsolatedPixel],
+        seed_points: &[SeedPoint],
+    ) {
+        println!("=== Contour Analysis with Chain Code Encoding ===");
+        println!();
+
+        for (i, contour) in contours.iter().enumerate() {
+            let boundary_type = if contour.is_outer { "Outer" } else { "Hole" };
+            let parent_info = match contour.parent_id {
+                Some(pid) => format!("Parent: {pid}"),
+                None => "Root".to_string(),
+            };
+
+            println!("Contour {i}: {boundary_type} boundary, {parent_info}");
+            println!(
+                "  Start Point: ({}, {})",
+                contour.start_point.x, contour.start_point.y
+            );
+
+            // Chain code stats
+            let reconstructed_points = contour.reconstruct_points();
+            println!("  Reconstructed points: {}", reconstructed_points.len());
+            println!("  Chain code length: {}", contour.chain_code.len());
+            println!(
+                "  Chain code: {:?}",
+                if contour.chain_code.len() > 20 {
+                    format!("{:?}...", &contour.chain_code[..20])
+                } else {
+                    format!("{:?}", contour.chain_code)
+                }
+            );
+
+            // Storage analysis
+            let coordinate_storage_bits = reconstructed_points.len() * 16; // 2 bytes per point
+            let chain_code_storage_bits = 16 + (contour.chain_code.len() * 2); // start point + 2 bits per direction
+
+            let compression_ratio = if chain_code_storage_bits > 0 {
+                coordinate_storage_bits as f64 / chain_code_storage_bits as f64
             } else {
                 1.0
             }
         );
 
-        let chain_compression_ratio = if total_chain_code_bits > 0 {
-            total_uncompressed_chain_bits as f64 / total_chain_code_bits as f64
+            println!("  Storage Analysis:");
+            println!(
+                "    Coordinates: {} bits ({} bytes)",
+                coordinate_storage_bits,
+                coordinate_storage_bits / 8
+            );
+            println!(
+                "    Chain codes: {} bits ({} bytes)",
+                chain_code_storage_bits,
+                (chain_code_storage_bits + 7) / 8
+            );
+            println!("    Compression ratio: {:.2}x", compression_ratio);
+            println!("  ---");
+        }
+
+        // Isolated pixels analysis
+        if !isolated_pixels.is_empty() {
+            println!("=== Isolated Pixels Analysis ===");
+            println!("Number of isolated pixels: {}", isolated_pixels.len());
+            let isolated_storage_bits = isolated_pixels.len() * 16; // 2 bytes per point (x, y)
+            println!(
+                "Storage: {} bits ({} bytes)",
+                isolated_storage_bits,
+                (isolated_storage_bits + 7) / 8
+            );
+
+            // Show first few isolated pixels as examples
+            let num_to_show = std::cmp::min(10, isolated_pixels.len());
+            print!("Sample isolated pixels: ");
+            for (i, pixel) in isolated_pixels.iter().take(num_to_show).enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                print!("({}, {})", pixel.x, pixel.y);
+            }
+            if isolated_pixels.len() > num_to_show {
+                print!("...");
+            }
+            println!();
+            println!("  ---");
+        }
+
+        // Seed points analysis
+        if !seed_points.is_empty() {
+            println!("=== Flood Fill Seed Points Analysis ===");
+            println!("Number of seed points: {}", seed_points.len());
+            let seed_storage_bits = seed_points.len() * 24; // 3 bytes per seed (x, y, contour_id)
+            println!(
+                "Storage: {} bits ({} bytes)",
+                seed_storage_bits,
+                (seed_storage_bits + 7) / 8
+            );
+
+            println!("Seed points for reliable flood fill:");
+            for seed in seed_points {
+                println!(
+                    "  Contour {}: seed at ({}, {})",
+                    seed.contour_id, seed.x, seed.y
+                );
+            }
+            println!("  ---");
+        }
+
+        // Overall statistics
+        let total_reconstructed_points: usize =
+            contours.iter().map(|c| c.reconstruct_points().len()).sum();
+        let total_chain_code_length: usize = contours.iter().map(|c| c.chain_code.len()).sum();
+
+        let total_coordinate_bits = total_reconstructed_points * 16;
+        let total_chain_code_bits = contours.len() * 16 + total_chain_code_length * 2; // start points + chain codes
+        let total_isolated_bits = isolated_pixels.len() * 16;
+
+        let overall_compression_ratio = if total_chain_code_bits > 0 {
+            total_coordinate_bits as f64 / total_chain_code_bits as f64
         } else {
             1.0
         };
 
+        println!("=== Overall Statistics ===");
+        println!("Total contours: {}", contours.len());
+        println!("Total isolated pixels: {}", isolated_pixels.len());
+        println!("Total reconstructed points: {}", total_reconstructed_points);
+        println!("Total chain code length: {}", total_chain_code_length);
         println!(
-            "Chain code compression: {} -> {} bits ({:.2}x reduction)",
-            total_uncompressed_chain_bits, total_chain_code_bits, chain_compression_ratio
+            "Contour storage: {} bits -> {} bits (compression: {:.2}x)",
+            total_coordinate_bits, total_chain_code_bits, overall_compression_ratio
         );
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-
-        let database = ContourDatabase {
-            images,
-            encoder_version: "1.0".to_string(),
-            epsilon: EPSILON,
-            created_at: timestamp,
-        };
-
-        Ok(database)
+        println!("Isolated pixels storage: {} bits", total_isolated_bits);
+        println!(
+            "Total feature storage: {} bits ({:.1} KB)",
+            total_chain_code_bits + total_isolated_bits,
+            (total_chain_code_bits + total_isolated_bits) as f64 / 8192.0
+        );
     }
 }
 
@@ -967,72 +1431,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory_path = &args[1];
     let mut encoder = ContourEncoder::new(180, 135);
 
-    println!("=== Contour Encoder with Pot Serialization ===");
-    println!("Target resolution: {}x{}", 180, 135);
-    println!("Douglas-Peucker epsilon: {}", EPSILON);
-    println!();
+    match encoder.encode_image(image_path) {
+        Ok((overlay_img, contour_only_img, frame_data)) => {
+            // Save output images
+            let base_name = Path::new(image_path).file_stem().unwrap().to_str().unwrap();
 
-    match encoder.encode_directory(directory_path) {
-        Ok(database) => {
-            // Serialize to pot format
-            let serialized = pot::to_vec(&database)?;
+            let overlay_path = format!("{base_name}_overlay.png");
+            let contour_path = format!("{base_name}_contour.png");
+            let data_path = format!("{base_name}_frame.cbor");
 
-            // Create output filename
-            let dir_path = Path::new(directory_path);
-            let dir_name = dir_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("contours");
-            let output_filename = format!("{}_contours.pot", dir_name);
+            overlay_img.save(&overlay_path)?;
+            contour_only_img.save(&contour_path)?;
+            frame_data.save_to_file(&data_path)?;
 
-            // Save to file
-            fs::write(&output_filename, &serialized)?;
+            println!("Saved overlay image to: {overlay_path}");
+            println!("Saved contour image to: {contour_path}");
+            println!("Saved frame data to: {data_path}");
 
-            println!("\n=== Serialization Complete ===");
-            println!("Output file: {}", output_filename);
-            println!("File size: {:.1} KB", serialized.len() as f64 / 1024.0);
-            println!(
-                "Compression ratio: {:.2}x",
-                (database.images.len() * 180 * 135 * 3) as f64 / serialized.len() as f64
-            );
+            // Print statistics
+            frame_data.print_stats();
 
-            // Print details about chain code efficiency
-            let total_packed_chain_bits: usize = database
-                .images
-                .iter()
-                .flat_map(|img| &img.contours)
-                .map(|c| c.chain_code.bits_used())
-                .sum();
-
-            let total_original_chain_bits: usize = database
-                .images
-                .iter()
-                .flat_map(|img| &img.contours)
-                .map(|c| c.chain_code.length * 8) // 8 bits if stored as Vec<u8>
-                .sum();
-
-            println!(
-                "Total chain codes: {} directions",
-                database
-                    .images
-                    .iter()
-                    .flat_map(|img| &img.contours)
-                    .map(|c| c.chain_code.length)
-                    .sum::<usize>()
-            );
-            println!(
-                "Chain code storage: {} bits (vs {} unpacked: {:.2}x compression)",
-                total_packed_chain_bits,
-                total_original_chain_bits,
-                if total_packed_chain_bits > 0 {
-                    total_original_chain_bits as f64 / total_packed_chain_bits as f64
-                } else {
-                    1.0
-                }
-            );
-            println!(
-                "Chain code overhead: {:.1} KB",
-                total_packed_chain_bits as f64 / 8192.0
+            // Print chain codes for analysis
+            let contours = frame_data.to_contours();
+            encoder.print_chain_codes(
+                &contours,
+                &frame_data.isolated_pixels,
+                &frame_data.seed_points,
             );
         }
         Err(e) => {
