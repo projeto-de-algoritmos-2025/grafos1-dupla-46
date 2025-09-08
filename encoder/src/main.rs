@@ -1,7 +1,6 @@
 use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
@@ -13,137 +12,6 @@ impl Point {
     const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
-}
-
-// Packed chain code structure for efficient storage
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PackedChainCode {
-    pub data: Vec<u32>, // Each u32 stores up to 16 directions (2 bits each)
-    pub length: usize,  // Actual number of direction codes
-}
-
-impl PackedChainCode {
-    pub fn new() -> Self {
-        Self {
-            data: Vec::new(),
-            length: 0,
-        }
-    }
-
-    pub fn from_directions(directions: &[u8]) -> Self {
-        let mut packed = Self::new();
-        packed.pack_directions(directions);
-        packed
-    }
-
-    fn pack_directions(&mut self, directions: &[u8]) {
-        self.length = directions.len();
-        self.data.clear();
-
-        if directions.is_empty() {
-            return;
-        }
-
-        // Calculate how many u32s we need (16 directions per u32)
-        let num_u32s = (directions.len() + 15) / 16;
-        self.data.reserve(num_u32s);
-
-        let mut current_u32 = 0u32;
-        let mut bit_position = 0;
-
-        for &direction in directions {
-            // Pack 2 bits for each direction
-            current_u32 |= (direction as u32 & 0b11) << bit_position;
-            bit_position += 2;
-
-            // If we've filled 16 directions (32 bits), store and start new u32
-            if bit_position >= 32 {
-                self.data.push(current_u32);
-                current_u32 = 0;
-                bit_position = 0;
-            }
-        }
-
-        // Store the last partially filled u32 if needed
-        if bit_position > 0 {
-            self.data.push(current_u32);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn unpack_directions(&self) -> Vec<u8> {
-        let mut directions = Vec::with_capacity(self.length);
-
-        for (chunk_idx, &packed_data) in self.data.iter().enumerate() {
-            for bit_pos in (0..32).step_by(2) {
-                let direction_idx = chunk_idx * 16 + bit_pos / 2;
-                if direction_idx >= self.length {
-                    break;
-                }
-
-                let direction = ((packed_data >> bit_pos) & 0b11) as u8;
-                directions.push(direction);
-            }
-        }
-
-        directions
-    }
-
-    pub fn bits_used(&self) -> usize {
-        self.data.len() * 32
-    }
-
-    pub fn compression_ratio(&self) -> f64 {
-        if self.length == 0 {
-            return 1.0;
-        }
-        (self.length * 8) as f64 / self.bits_used() as f64
-    }
-}
-
-// Serializable structures for pot encoding
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SerializablePoint {
-    pub x: i32,
-    pub y: i32,
-}
-
-impl From<Point> for SerializablePoint {
-    fn from(point: Point) -> Self {
-        Self {
-            x: point.x,
-            y: point.y,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SerializableContour {
-    pub chain_code: PackedChainCode,
-    pub start_point: SerializablePoint,
-    pub is_outer: bool,
-    pub parent_id: Option<usize>,
-    pub point_count: usize, // Original number of points before simplification
-    pub simplified_count: usize, // Number of points after simplification
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ImageContours {
-    pub filename: String,
-    pub width: u32,
-    pub height: u32,
-    pub target_width: u32,
-    pub target_height: u32,
-    pub was_inverted: bool,
-    pub contours: Vec<SerializableContour>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ContourDatabase {
-    pub images: Vec<ImageContours>,
-    pub encoder_version: String,
-    pub epsilon: f64,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -538,19 +406,15 @@ impl ContourEncoder {
         // Detect if the image is inverted (more white than black pixels)
         let is_inverted = self.detect_inversion(&resized);
 
-        println!(
-            "Processing: {} ({}x{}, inverted: {})",
-            image_path.display(),
-            self.width,
-            self.height,
-            is_inverted
-        );
+        println!("Image dimensions: {}x{}", self.width, self.height);
+        println!("Image is inverted: {is_inverted}");
 
         // Convert to binary and invert if necessary
         let binary_img = self.to_binary(&resized, is_inverted);
 
         // Find contours using Suzuki-Abe algorithm
         let contours = self.find_contours_suzuki_abe(&binary_img);
+        println!("Found {} contours", contours.len());
 
         // Find isolated pixels
         let isolated_pixels = self.find_isolated_pixels(&binary_img);
@@ -1179,8 +1043,8 @@ impl ContourEncoder {
         }
     }
 
-    fn points_to_chain_code(&self, points: &[Point]) -> PackedChainCode {
-        let mut directions = Vec::new();
+    fn points_to_chain_code(&self, points: &[Point]) -> Vec<u8> {
+        let mut chain_code = Vec::new();
 
         for i in 0..points.len() {
             let curr = points[i];
@@ -1198,10 +1062,10 @@ impl ContourEncoder {
                 _ => continue, // skip diagonal or invalid moves
             };
 
-            directions.push(code);
+            chain_code.push(code);
         }
 
-        PackedChainCode::from_directions(&directions)
+        chain_code
     }
 
     fn create_overlay_image(
@@ -1321,8 +1185,7 @@ impl ContourEncoder {
                 coordinate_storage_bits as f64 / chain_code_storage_bits as f64
             } else {
                 1.0
-            }
-        );
+            };
 
             println!("  Storage Analysis:");
             println!(
@@ -1423,12 +1286,11 @@ impl ContourEncoder {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} <directory_path>", args[0]);
-        eprintln!("This will process all PNG files in the directory and create a .pot file");
+        eprintln!("Usage: {} <image_path>", args[0]);
         std::process::exit(1);
     }
 
-    let directory_path = &args[1];
+    let image_path = &args[1];
     let mut encoder = ContourEncoder::new(180, 135);
 
     match encoder.encode_image(image_path) {
@@ -1460,7 +1322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Err(e) => {
-            eprintln!("Error processing directory: {}", e);
+            eprintln!("Error processing image: {e}");
             std::process::exit(1);
         }
     }
