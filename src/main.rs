@@ -1,4 +1,5 @@
 use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,211 @@ impl Contour {
     }
 }
 
+// Serializable structures for compact storage
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SerializableContour {
+    pub start_x: i32,
+    pub start_y: i32,
+    pub is_outer: bool,
+    pub parent_id: Option<usize>,
+    pub packed_chain_code: Vec<u32>, // Each u32 holds up to 16 directions (2 bits each)
+    pub chain_code_length: usize,    // Original length before packing
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FrameData {
+    pub width: u32,
+    pub height: u32,
+    pub contours: Vec<SerializableContour>,
+}
+
+impl SerializableContour {
+    // Convert from internal Contour to serializable format
+    pub fn from_contour(contour: &Contour) -> Self {
+        let (packed_chain_code, chain_code_length) = Self::pack_chain_code(&contour.chain_code);
+
+        Self {
+            start_x: contour.start_point.x,
+            start_y: contour.start_point.y,
+            is_outer: contour.is_outer,
+            parent_id: contour.parent_id,
+            packed_chain_code,
+            chain_code_length,
+        }
+    }
+
+    // Convert back to internal Contour format
+    pub fn to_contour(&self) -> Contour {
+        let chain_code = Self::unpack_chain_code(&self.packed_chain_code, self.chain_code_length);
+
+        Contour {
+            start_point: Point::new(self.start_x, self.start_y),
+            chain_code,
+            is_outer: self.is_outer,
+            parent_id: self.parent_id,
+        }
+    }
+
+    // Pack chain code directions (0-3) into u32s using 2 bits per direction
+    fn pack_chain_code(chain_code: &[u8]) -> (Vec<u32>, usize) {
+        let original_length = chain_code.len();
+        if original_length == 0 {
+            return (Vec::new(), 0);
+        }
+
+        let mut packed = Vec::new();
+        let mut current_u32 = 0u32;
+        let mut bits_used = 0;
+
+        for &direction in chain_code {
+            // Ensure direction is valid (0-3)
+            let dir = (direction & 0x03) as u32;
+
+            // Shift the direction to its position and add to current u32
+            current_u32 |= dir << bits_used;
+            bits_used += 2;
+
+            // If we've filled the u32 (16 directions * 2 bits = 32 bits), store it
+            if bits_used >= 32 {
+                packed.push(current_u32);
+                current_u32 = 0;
+                bits_used = 0;
+            }
+        }
+
+        // Store any remaining bits
+        if bits_used > 0 {
+            packed.push(current_u32);
+        }
+
+        (packed, original_length)
+    }
+
+    // Unpack chain code from u32s back to Vec<u8>
+    fn unpack_chain_code(packed: &[u32], original_length: usize) -> Vec<u8> {
+        if original_length == 0 {
+            return Vec::new();
+        }
+
+        let mut chain_code = Vec::with_capacity(original_length);
+        let mut remaining = original_length;
+
+        for &packed_u32 in packed {
+            let mut current = packed_u32;
+            let directions_in_this_u32 = std::cmp::min(16, remaining);
+
+            for _ in 0..directions_in_this_u32 {
+                let direction = (current & 0x03) as u8;
+                chain_code.push(direction);
+                current >>= 2;
+            }
+
+            remaining -= directions_in_this_u32;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        chain_code
+    }
+
+    // Calculate compression statistics
+    pub fn compression_stats(&self) -> (usize, usize, f64) {
+        let original_bits = self.chain_code_length * 8; // 1 byte per direction originally
+        let compressed_bits = self.packed_chain_code.len() * 32; // u32s
+        let compression_ratio = if compressed_bits > 0 {
+            original_bits as f64 / compressed_bits as f64
+        } else {
+            1.0
+        };
+
+        (original_bits, compressed_bits, compression_ratio)
+    }
+}
+
+impl FrameData {
+    pub fn from_contours(width: u32, height: u32, contours: &[Contour]) -> Self {
+        let serializable_contours = contours
+            .iter()
+            .map(SerializableContour::from_contour)
+            .collect();
+
+        Self {
+            width,
+            height,
+            contours: serializable_contours,
+        }
+    }
+
+    pub fn to_contours(&self) -> Vec<Contour> {
+        self.contours.iter().map(|sc| sc.to_contour()).collect()
+    }
+
+    // Serialize to binary format using POT
+    pub fn serialize(&self) -> Result<Vec<u8>, pot::Error> {
+        pot::to_vec(self)
+    }
+
+    // Deserialize from binary format
+    pub fn deserialize(data: &[u8]) -> Result<Self, pot::Error> {
+        pot::from_slice(data)
+    }
+
+    // Save to file
+    pub fn save_to_file(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let data = self.serialize()?;
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+
+    // Load from file
+    pub fn load_from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let data = std::fs::read(path)?;
+        Ok(Self::deserialize(&data)?)
+    }
+
+    // Print compression statistics
+    pub fn print_stats(&self) {
+        println!("=== Frame Serialization Statistics ===");
+        println!("Image dimensions: {}x{}", self.width, self.height);
+        println!("Number of contours: {}", self.contours.len());
+
+        let mut total_original_bits = 0;
+        let mut total_compressed_bits = 0;
+
+        for (i, contour) in self.contours.iter().enumerate() {
+            let (orig, comp, ratio) = contour.compression_stats();
+            total_original_bits += orig;
+            total_compressed_bits += comp;
+
+            println!(
+                "Contour {}: {} -> {} bits ({}x compression)",
+                i, orig, comp, ratio
+            );
+        }
+
+        let overall_ratio = if total_compressed_bits > 0 {
+            total_original_bits as f64 / total_compressed_bits as f64
+        } else {
+            1.0
+        };
+
+        println!(
+            "Overall chain code compression: {} -> {} bits ({:.2}x)",
+            total_original_bits, total_compressed_bits, overall_ratio
+        );
+
+        // Estimate total serialized size
+        if let Ok(serialized) = self.serialize() {
+            println!(
+                "Total serialized size: {} bytes ({:.2} KB)",
+                serialized.len(),
+                serialized.len() as f64 / 1024.0
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ContourEncoder {
     width: u32,
@@ -70,7 +276,7 @@ impl ContourEncoder {
     pub fn encode_image(
         &mut self,
         image_path: &str,
-    ) -> Result<(RgbImage, GrayImage), Box<dyn std::error::Error>> {
+    ) -> Result<(RgbImage, GrayImage, FrameData), Box<dyn std::error::Error>> {
         // Load and preprocess the image
         let img = image::open(image_path)?;
         let gray_img = img.to_luma8();
@@ -99,11 +305,14 @@ impl ContourEncoder {
         let contours = self.find_contours_suzuki_abe(&binary_img);
         println!("Found {} contours", contours.len());
 
+        // Create serializable frame data
+        let frame_data = FrameData::from_contours(self.width, self.height, &contours);
+
         // Generate output images
         let overlay_img = self.create_overlay_image(&resized, &contours);
         let contour_only_img = self.create_contour_only_image(&contours);
 
-        Ok((overlay_img, contour_only_img))
+        Ok((overlay_img, contour_only_img, frame_data))
     }
 
     fn detect_inversion(&self, img: &GrayImage) -> bool {
@@ -284,7 +493,7 @@ impl ContourEncoder {
             }
         }
 
-        let mut lnbd = 1i32;
+        let mut lnbd;
         let mut nbd = 1i32;
         let mut contours = Vec::new();
         let mut parents = vec![-1i32]; // parents[i] = parent border number of border i
@@ -649,31 +858,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut encoder = ContourEncoder::new(180, 135);
 
     match encoder.encode_image(image_path) {
-        Ok((overlay_img, contour_only_img)) => {
+        Ok((overlay_img, contour_only_img, frame_data)) => {
             // Save output images
             let base_name = Path::new(image_path).file_stem().unwrap().to_str().unwrap();
 
             let overlay_path = format!("{base_name}_overlay.png");
             let contour_path = format!("{base_name}_contour.png");
+            let data_path = format!("{base_name}_frame.pot");
 
             overlay_img.save(&overlay_path)?;
             contour_only_img.save(&contour_path)?;
+            frame_data.save_to_file(&data_path)?;
 
             println!("Saved overlay image to: {overlay_path}");
             println!("Saved contour image to: {contour_path}");
+            println!("Saved frame data to: {data_path}");
 
-            // For demonstration, let's find contours again to print chain codes
-            let gray_img = image::open(image_path)?.to_luma8();
-            let resized = image::imageops::resize(
-                &gray_img,
-                encoder.target_width,
-                encoder.target_height,
-                image::imageops::FilterType::Nearest,
-            );
-            let is_inverted = encoder.detect_inversion(&resized);
-            let binary_img = encoder.to_binary(&resized, is_inverted);
-            let contours = encoder.find_contours_suzuki_abe(&binary_img);
+            // Print statistics
+            frame_data.print_stats();
 
+            // Print chain codes for analysis
+            let contours = frame_data.to_contours();
             encoder.print_chain_codes(&contours);
         }
         Err(e) => {
